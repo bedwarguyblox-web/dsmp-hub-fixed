@@ -1,0 +1,252 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: Bot Dashboard API — reads stats from the Discord bot's SQLite database
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: stats
+    description: Summary statistics
+  - name: vouches
+    description: Vouch and scam-vouch data
+  - name: strikes
+    description: Strike records
+  - name: builder
+    description: Builder cases and payments
+  - name: activity
+    description: Recent staff actions
+
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /stats:
+    get:
+      operationId: getStats
+      tags: [stats]
+      summary: Overall bot statistics
+      responses:
+        "200":
+          description: Summary stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotStats"
+
+  /vouches/leaderboard:
+    get:
+      operationId: getVouchLeaderboard
+      tags: [vouches]
+      summary: Top vouched users
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 10
+      responses:
+        "200":
+          description: Leaderboard rows
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LeaderboardEntry"
+
+  /scamvouches/leaderboard:
+    get:
+      operationId: getScamVouchLeaderboard
+      tags: [vouches]
+      summary: Top scam-vouched users
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 10
+      responses:
+        "200":
+          description: Leaderboard rows
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LeaderboardEntry"
+
+  /strikes/recent:
+    get:
+      operationId: getRecentStrikes
+      tags: [strikes]
+      summary: Most recent strike events
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        "200":
+          description: Recent strike history rows
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StrikeEvent"
+
+  /builder/cases:
+    get:
+      operationId: getBuilderCases
+      tags: [builder]
+      summary: All builder protection timer cases
+      responses:
+        "200":
+          description: Cases list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BuilderCase"
+
+  /builder/payments:
+    get:
+      operationId: getBuilderPayments
+      tags: [builder]
+      summary: Recent builder payment records
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        "200":
+          description: Payment records
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BuilderPayment"
+
+  /activity:
+    get:
+      operationId: getRecentActivity
+      tags: [activity]
+      summary: Recent staff action log
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 30
+      responses:
+        "200":
+          description: Recent activity events
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ActivityEvent"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+
+    BotStats:
+      type: object
+      required:
+        - totalVouches
+        - totalScamVouches
+        - totalStrikes
+        - totalBuilderCases
+        - totalPayments
+        - activeTimers
+        - recentActions
+      properties:
+        totalVouches:      { type: integer }
+        totalScamVouches:  { type: integer }
+        totalStrikes:      { type: integer }
+        totalBuilderCases: { type: integer }
+        totalPayments:     { type: integer }
+        activeTimers:      { type: integer }
+        recentActions:     { type: integer }
+
+    LeaderboardEntry:
+      type: object
+      required: [userId, total, rank]
+      properties:
+        userId: { type: string }
+        total:  { type: integer }
+        rank:   { type: integer }
+
+    StrikeEvent:
+      type: object
+      required: [id, userId, moderatorId, reason, action, timestamp]
+      properties:
+        id:          { type: integer }
+        userId:      { type: string }
+        moderatorId: { type: string }
+        reason:      { type: string }
+        action:      { type: string }
+        timestamp:   { type: string }
+
+    BuilderCase:
+      type: object
+      required: [caseId, builderId, customerId, ign, amount, status, createdAt]
+      properties:
+        caseId:     { type: string }
+        builderId:  { type: string }
+        customerId: { type: string }
+        ign:        { type: string }
+        amount:     { type: string }
+        status:     { type: string }
+        startTime:  { type: ["string", "null"] }
+        endTime:    { type: ["string", "null"] }
+        createdAt:  { type: string }
+
+    BuilderPayment:
+      type: object
+      required: [id, paymentId, staffId, ign, amount, timestamp]
+      properties:
+        id:        { type: integer }
+        paymentId: { type: string }
+        staffId:   { type: string }
+        ign:       { type: string }
+        amount:    { type: string }
+        timestamp: { type: string }
+
+    ActivityEvent:
+      type: object
+      required: [id, actionType, actorId, timestamp]
+      properties:
+        id:         { type: integer }
+        actionType: { type: string }
+        actorId:    { type: string }
+        targetId:   { type: ["string", "null"] }
+        details:    { type: ["string", "null"] }
+        timestamp:  { type: string }
