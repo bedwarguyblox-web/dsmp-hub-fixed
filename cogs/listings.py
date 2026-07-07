@@ -97,6 +97,71 @@ def _gen_listing_id(listing_type: str) -> str:
     num = random.randint(1000, 9999)
     return f"{prefix}-{num}"
 
+# ── Price helpers ──────────────────────────────────────────────────────────────
+
+def parse_price(s: str) -> float:
+    """
+    Parse a monetary value that may use shorthand suffixes (case-insensitive).
+    Strips leading $, commas, and spaces before parsing.
+
+    Supported suffixes:
+        k  → × 1,000          (e.g. "100k"  → 100,000)
+        m  → × 1,000,000      (e.g. "2m"    → 2,000,000)
+        b  → × 1,000,000,000  (e.g. "5b"    → 5,000,000,000)
+        t  → × 1,000,000,000,000
+
+    Examples:
+        "5000"   → 5000.0
+        "1,500"  → 1500.0
+        "$2k"    → 2000.0
+        "1.5m"   → 1500000.0
+        "5b"     → 5000000000.0
+
+    Raises ValueError for invalid/non-positive/non-finite input.
+    """
+    s = s.strip().lstrip("$").replace(",", "").replace(" ", "")
+    if not s:
+        raise ValueError("Empty price")
+    _SUFFIXES = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000, "t": 1_000_000_000_000}
+    lower = s.lower()
+    val: float
+    for suffix, multiplier in _SUFFIXES.items():
+        if lower.endswith(suffix):
+            val = float(lower[:-1]) * multiplier
+            break
+    else:
+        val = float(s)
+    if not (0 < val < float("inf")):
+        raise ValueError(f"Price must be a positive finite number, got: {val}")
+    return val
+
+
+def _normalise_price(s: str) -> str:
+    """
+    Convert a price string (plain or shorthand) to a canonical integer/float
+    string suitable for DB storage and downstream float() calls.
+    Returns the original string unchanged if it cannot be parsed (so callers
+    that already validate can rely on the return value being numeric).
+    """
+    val = parse_price(s)
+    if val == int(val):
+        return str(int(val))
+    return f"{val:.2f}"
+
+
+def _fmt_price(val) -> str:
+    """Format a stored price value (str or number) with thousand-separators for display."""
+    if val is None or val == "":
+        return "N/A"
+    try:
+        f = float(val)
+        if f == int(f):
+            return f"{int(f):,}"
+        return f"{f:,.2f}"
+    except (ValueError, TypeError):
+        return str(val)
+
+
 # ── Embed builders ─────────────────────────────────────────────────────────────
 
 def _stars(avg: float, count: int) -> str:
@@ -144,20 +209,20 @@ def _build_listing_embed(data: dict, guild: discord.Guild, is_preview: bool = Fa
         embed.add_field(name="Description", value=desc[:500], inline=False)
 
     if ltype == "auction":
-        buy_now = data.get("buy_now_price") or "N/A"
+        buy_now = _fmt_price(data.get("buy_now_price"))
         embed.add_field(name="🏷️ AUCTION", value=f"**Buy Now:** ${buy_now}", inline=False)
     else:
-        starting = data.get("starting_bid") or "N/A"
-        current  = data.get("current_bid") or "No bids yet"
+        starting = _fmt_price(data.get("starting_bid"))
+        current  = data.get("current_bid")
         bidder   = data.get("current_bidder")
         bidder_s = f"<@{bidder}>" if bidder else "None"
-        min_inc  = data.get("min_increment") or "N/A"
+        min_inc  = _fmt_price(data.get("min_increment"))
         reserve  = data.get("reserve_price")
         ends_at  = data.get("ends_at")
 
         lines = [
             f"**Starting Bid:** ${starting}",
-            f"**Current Bid:** {current if not bidder else f'${current}'}",
+            f"**Current Bid:** {'No bids yet' if not bidder else f'${_fmt_price(current)}'}",
             f"**Current Bidder:** {bidder_s}",
             f"**Min Increment:** ${min_inc}",
         ]
@@ -165,7 +230,7 @@ def _build_listing_embed(data: dict, guild: discord.Guild, is_preview: bool = Fa
             lines.append("**Reserve:** Hidden")
         buy_now = data.get("buy_now_price")
         if buy_now:
-            lines.append(f"**Buy Now:** ${buy_now}")
+            lines.append(f"**Buy Now:** ${_fmt_price(buy_now)}")
         if ends_at:
             try:
                 try:
@@ -207,7 +272,7 @@ class AuctionModal(discord.ui.Modal, title="Create Auction Listing"):
     )
     buy_now_price = discord.ui.TextInput(
         label="Buy Now Price ($)",
-        placeholder="e.g. 5000",
+        placeholder="e.g. 5000, 100k, 2.5m, 5b",
         max_length=30,
     )
 
@@ -222,13 +287,22 @@ class AuctionModal(discord.ui.Modal, title="Create Auction Listing"):
             self.buy_now_price.default = prefill.get("buy_now_price", "")
 
     async def on_submit(self, interaction: discord.Interaction):
+        raw_price = self.buy_now_price.value.strip()
+        try:
+            norm_price = _normalise_price(raw_price)
+        except (ValueError, ZeroDivisionError, OverflowError):
+            await interaction.response.send_message(
+                "❌ Invalid buy-now price. Enter a positive number like `5000`, `100k`, `2.5m`, or `5b`.",
+                ephemeral=True,
+            )
+            return
         data = {
             "type":          "auction",
             "category":      self._category,
             "item_name":     self.item_name.value.strip(),
             "description":   self.description.value.strip(),
             "quantity":      self.quantity.value.strip(),
-            "buy_now_price": self.buy_now_price.value.strip(),
+            "buy_now_price": norm_price,
         }
         await self._cog._show_preview(interaction, data)
 
@@ -253,12 +327,12 @@ class BiddingModal(discord.ui.Modal, title="Create Bidding Listing"):
     )
     starting_bid = discord.ui.TextInput(
         label="Starting Bid ($)",
-        placeholder="e.g. 1000",
+        placeholder="e.g. 1000, 50k, 1m",
         max_length=30,
     )
     min_increment = discord.ui.TextInput(
         label="Min Bid Increment ($)",
-        placeholder="e.g. 50",
+        placeholder="e.g. 50, 1k, 500k",
         max_length=30,
     )
 
@@ -276,14 +350,32 @@ class BiddingModal(discord.ui.Modal, title="Create Bidding Listing"):
             self.min_increment.default = prefill.get("min_increment", "")
 
     async def on_submit(self, interaction: discord.Interaction):
+        raw_starting = self.starting_bid.value.strip()
+        raw_increment = self.min_increment.value.strip()
+        try:
+            norm_starting = _normalise_price(raw_starting)
+        except (ValueError, ZeroDivisionError, OverflowError):
+            await interaction.response.send_message(
+                "❌ Invalid starting bid. Enter a positive number like `5000`, `100k`, `2.5m`, or `5b`.",
+                ephemeral=True,
+            )
+            return
+        try:
+            norm_increment = _normalise_price(raw_increment)
+        except (ValueError, ZeroDivisionError, OverflowError):
+            await interaction.response.send_message(
+                "❌ Invalid min increment. Enter a positive number like `500`, `1k`, `0.5m`, etc.",
+                ephemeral=True,
+            )
+            return
         data = {
             "type":           "bidding",
             "category":       self._category,
             "item_name":      self.item_name.value.strip(),
             "description":    self.description.value.strip(),
             "quantity":       self.quantity.value.strip(),
-            "starting_bid":   self.starting_bid.value.strip(),
-            "min_increment":  self.min_increment.value.strip(),
+            "starting_bid":   norm_starting,
+            "min_increment":  norm_increment,
             "buy_now_price":  None,
             "reserve_price":  None,
             "duration_label": self._duration_label,
@@ -295,7 +387,7 @@ class BiddingModal(discord.ui.Modal, title="Create Bidding Listing"):
 class OfferModal(discord.ui.Modal, title="Make an Offer"):
     offer_amount = discord.ui.TextInput(
         label="Offer Amount ($)",
-        placeholder="e.g. 4500",
+        placeholder="e.g. 4500, 100k, 2m",
         max_length=30,
     )
     message = discord.ui.TextInput(
@@ -319,7 +411,7 @@ class OfferModal(discord.ui.Modal, title="Make an Offer"):
 class BidModal(discord.ui.Modal, title="Place a Bid"):
     bid_amount = discord.ui.TextInput(
         label="Your Bid ($)",
-        placeholder="Must meet the minimum",
+        placeholder="e.g. 5000, 100k, 2m — must meet the minimum",
         max_length=30,
     )
 
@@ -337,7 +429,7 @@ class BidModal(discord.ui.Modal, title="Place a Bid"):
 class CounterOfferModal(discord.ui.Modal, title="Counter Offer"):
     counter_amount = discord.ui.TextInput(
         label="Your Counter Offer ($)",
-        placeholder="e.g. 4800",
+        placeholder="e.g. 4800, 100k, 2m",
         max_length=30,
     )
 
@@ -643,7 +735,7 @@ class ListingsCog(commands.Cog, name="Listings"):
                             pass
                 await self._post_log(guild, log_ch_id, "Listing Expired → Sold", discord.Color.green(), [
                     ("Item", row["item_name"], True), ("Seller", f"<@{seller_id}>", True),
-                    ("Buyer", f"<@{buyer_id}>", True), ("Final Price", f"${current_bid}", True),
+                    ("Buyer", f"<@{buyer_id}>", True), ("Final Price", f"${_fmt_price(current_bid)}", True),
                     ("Listing ID", listing_id, True),
                     ("Timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), False),
                 ])
@@ -1357,7 +1449,7 @@ class ListingsCog(commands.Cog, name="Listings"):
             ("Item", row["item_name"], True),
             ("Buyer", interaction.user.mention, True),
             ("Seller", f"<@{seller_id}>", True),
-            ("Price", f"${buy_now}", True),
+            ("Price", f"${_fmt_price(buy_now)}", True),
             ("Listing ID", listing_id, True),
             ("Timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), False),
         ])
@@ -1391,6 +1483,15 @@ class ListingsCog(commands.Cog, name="Listings"):
             await interaction.response.send_message("Listing no longer available.", ephemeral=True)
             return
 
+        try:
+            amount = _normalise_price(amount)
+        except (ValueError, ZeroDivisionError, OverflowError):
+            await interaction.response.send_message(
+                "❌ Invalid offer amount. Enter a positive number like `5000`, `100k`, `2m`, etc.",
+                ephemeral=True,
+            )
+            return
+
         token = self._make_temp_id(interaction.user.id)
         self._offers[token] = {
             "listing_id": listing_id,
@@ -1419,7 +1520,7 @@ class ListingsCog(commands.Cog, name="Listings"):
             color=discord.Color.blurple(),
         )
         offer_embed.add_field(name="Buyer", value=interaction.user.mention, inline=True)
-        offer_embed.add_field(name="Offer",  value=f"${amount}", inline=True)
+        offer_embed.add_field(name="Offer",  value=f"${_fmt_price(amount)}", inline=True)
         offer_embed.add_field(name="Listing", value=listing_id, inline=True)
         if msg:
             offer_embed.add_field(name="Message", value=msg, inline=False)
@@ -1433,7 +1534,7 @@ class ListingsCog(commands.Cog, name="Listings"):
         await interaction.response.send_message(
             embed=discord.Embed(
                 title="💬 Offer Sent",
-                description=f"Your offer of **${amount}** has been sent to the seller.",
+                description=f"Your offer of **${_fmt_price(amount)}** has been sent to the seller.",
                 color=discord.Color.green(),
             ),
             ephemeral=True,
@@ -1525,6 +1626,15 @@ class ListingsCog(commands.Cog, name="Listings"):
 
     async def _handle_counter_submit(self, interaction: discord.Interaction,
                                       listing_id: str, buyer_id: int, counter: str):
+        try:
+            counter = _normalise_price(counter)
+        except (ValueError, ZeroDivisionError, OverflowError):
+            await interaction.response.send_message(
+                "❌ Invalid counter offer amount. Enter a positive number like `5000`, `100k`, `2m`, etc.",
+                ephemeral=True,
+            )
+            return
+
         row   = get_listing(listing_id)
         guild = interaction.guild
         buyer = (guild.get_member(buyer_id) if guild else None) or self.bot.get_user(buyer_id)
@@ -1550,7 +1660,7 @@ class ListingsCog(commands.Cog, name="Listings"):
         try:
             await buyer.send(embed=discord.Embed(
                 title=f"↩️ Counter Offer — {row['item_name'] if row else listing_id}",
-                description=f"The seller countered with **${counter}**. Do you accept?",
+                description=f"The seller countered with **${_fmt_price(counter)}**. Do you accept?",
                 color=discord.Color.orange(),
             ), view=view)
         except discord.Forbidden:
@@ -1656,9 +1766,12 @@ class ListingsCog(commands.Cog, name="Listings"):
             return
 
         try:
-            amount = float(amount_str.replace(",", "").replace("$", ""))
-        except ValueError:
-            await interaction.response.send_message("Invalid bid amount.", ephemeral=True)
+            amount = parse_price(amount_str)
+        except (ValueError, ZeroDivisionError, OverflowError):
+            await interaction.response.send_message(
+                "❌ Invalid bid amount. Enter a positive number like `5000`, `100k`, `2m`, etc.",
+                ephemeral=True,
+            )
             return
 
         current_bid = float(row["current_bid"] or row["starting_bid"] or 0)
@@ -1938,7 +2051,7 @@ class ListingsCog(commands.Cog, name="Listings"):
             timestamp=datetime.now(timezone.utc),
         )
         summary.add_field(name="Item",   value=listing_data.get("item_name", listing_id), inline=True)
-        summary.add_field(name="Price",  value=f"${final_price}" if final_price else "Offer", inline=True)
+        summary.add_field(name="Price",  value=f"${_fmt_price(final_price)}" if final_price else "Offer", inline=True)
         summary.add_field(name="Buyer",  value=f"<@{buyer_id}>",  inline=True)
         summary.add_field(name="Seller", value=f"<@{seller_id}>", inline=True)
         summary.add_field(name="Qty",    value=listing_data.get("quantity", "?"), inline=True)
@@ -2087,7 +2200,7 @@ class ListingsCog(commands.Cog, name="Listings"):
                 ("Item", row["item_name"] if row else listing_id, True),
                 ("Buyer", f"<@{buyer_id}>", True),
                 ("Seller", f"<@{seller_id}>", True),
-                ("Final Price", f"${txn['final_price']}" if txn["final_price"] else "N/A", True),
+                ("Final Price", f"${_fmt_price(txn['final_price'])}" if txn["final_price"] else "N/A", True),
                 ("Both Vouched", "Yes", True),
                 ("Timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), False),
             ])
