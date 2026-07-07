@@ -1740,19 +1740,45 @@ class ListingsCog(commands.Cog, name="Listings"):
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(f"{balance_api}{ign}", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                async with session.get(
+                    f"{balance_api}{ign}", timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    if resp.status == 404:
+                        await interaction.response.send_message(
+                            f"❌ Your IGN `{ign}` wasn't found on the server. "
+                            "Please double-check the spelling and update it with `/setign`.",
+                            ephemeral=True,
+                        )
+                        return
                     if resp.status == 200:
-                        api_data = await resp.json()
-                        balance  = float(api_data.get("balance", api_data.get("money", 0)))
-                        if balance < min_next:
-                            await interaction.response.send_message(
-                                f"❌ Insufficient balance. You need at least **${min_next:,.0f}** "
-                                f"but your balance is **${balance:,.0f}**.",
-                                ephemeral=True,
+                        # content_type=None avoids ContentTypeError when the API
+                        # sends JSON with a non-standard Content-Type header.
+                        api_data = await resp.json(content_type=None)
+                        raw_bal  = api_data.get("balance",
+                                    api_data.get("money",
+                                    api_data.get("coins")))
+                        if raw_bal is not None:
+                            balance = float(raw_bal)
+                            if balance < min_next:
+                                await interaction.response.send_message(
+                                    f"❌ Insufficient balance. You need at least **${min_next:,.0f}** "
+                                    f"but your balance is **${balance:,.0f}**.",
+                                    ephemeral=True,
+                                )
+                                return
+                        else:
+                            logger.warning(
+                                "Balance API response has no balance/money/coins key for IGN %s. "
+                                "Full response: %s", ign, api_data
                             )
-                            return
-        except Exception:
-            pass  # API unavailable — allow bid without balance check
+                    else:
+                        logger.warning(
+                            "Balance API returned unexpected status %s for IGN %s",
+                            resp.status, ign
+                        )
+        except Exception as exc:
+            logger.warning("Balance API check failed for IGN %s: %s", ign, exc)
+            # API unavailable — allow bid without balance check
 
         await interaction.response.send_modal(
             BidModal(self, listing_id, f"{min_next:,.0f}")
@@ -2801,12 +2827,56 @@ class ListingsCog(commands.Cog, name="Listings"):
     @app_commands.describe(ign="Your in-game name (case-sensitive)")
     async def setign(self, interaction: discord.Interaction, ign: str):
         await interaction.response.defer(ephemeral=True)
-        set_user_ign(interaction.user.id, ign.strip())
+        ign = ign.strip()
+        set_user_ign(interaction.user.id, ign)
+
+        # Immediately verify the IGN against the balance API so the user
+        # knows right away if they've mistyped their name.
+        balance_api = BOT_CONFIG.get("balanceApiUrl", "https://donutsmp.net/api/v1/balance/")
+        verify_line = ""
+        embed_color = discord.Color.green()
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{balance_api}{ign}", timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    if resp.status == 200:
+                        api_data = await resp.json(content_type=None)
+                        raw_bal  = api_data.get("balance",
+                                    api_data.get("money",
+                                    api_data.get("coins")))
+                        if raw_bal is not None:
+                            verify_line = (
+                                f"\n✅ Account verified — current balance: **${float(raw_bal):,.0f}**"
+                            )
+                        else:
+                            verify_line = "\n✅ Account found on the server."
+                    elif resp.status == 404:
+                        verify_line = (
+                            f"\n⚠️ **Player `{ign}` was not found on the server.** "
+                            "Double-check the spelling — IGN is case-sensitive."
+                        )
+                        embed_color = discord.Color.orange()
+                    else:
+                        verify_line = (
+                            f"\n⚠️ Could not verify account right now "
+                            f"(API status {resp.status}). Your IGN has been saved — "
+                            "if bids fail, run `/setign` again to re-check."
+                        )
+                        embed_color = discord.Color.orange()
+        except Exception as exc:
+            logger.warning("Balance API verify failed for IGN %s: %s", ign, exc)
+            verify_line = (
+                "\n⚠️ Balance API is unreachable right now — your IGN has been saved. "
+                "If bids fail, confirm your IGN is correct and try again."
+            )
+            embed_color = discord.Color.orange()
+
         await interaction.followup.send(
             embed=discord.Embed(
                 title="✅ IGN Registered",
-                description=f"IGN **{ign.strip()}** registered to your account.",
-                color=discord.Color.green(),
+                description=f"IGN **{ign}** has been linked to your account.{verify_line}",
+                color=embed_color,
             ),
             ephemeral=True,
         )
