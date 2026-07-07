@@ -1104,9 +1104,14 @@ def _ensure_listings_tables(conn):
             message_id      INTEGER,
             channel_id      INTEGER,
             bid_history     TEXT    NOT NULL DEFAULT '[]',
-            watchers        TEXT    NOT NULL DEFAULT '[]'
+            watchers        TEXT    NOT NULL DEFAULT '[]',
+            bumped_at       TEXT
         )
     """)
+    # Migration: add bumped_at to existing databases that predate this column
+    existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(listings)").fetchall()}
+    if "bumped_at" not in existing_cols:
+        conn.execute("ALTER TABLE listings ADD COLUMN bumped_at TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS listing_users (
             discord_id  INTEGER PRIMARY KEY,
@@ -1195,19 +1200,44 @@ def atomic_claim_listing(listing_id: str, new_status: str) -> bool:
     return cur.rowcount > 0
 
 
+def atomic_bump_claim(listing_id: str, seller_id: int, cooldown_hours: int) -> bool:
+    """Atomically set bumped_at=now() if the listing is active, belongs to seller_id,
+    and the cooldown has elapsed (or has never been bumped).
+    Returns True if the bump was claimed (one row updated), False otherwise.
+    A False result means either wrong seller, listing inactive, or cooldown not elapsed.
+    The single UPDATE prevents two simultaneous taps from both succeeding."""
+    with get_connection() as conn:
+        _ensure_listings_tables(conn)
+        cur = conn.execute(
+            """
+            UPDATE listings
+               SET bumped_at = datetime('now')
+             WHERE listing_id = ?
+               AND status    = 'active'
+               AND seller_id = ?
+               AND (bumped_at IS NULL
+                    OR bumped_at <= datetime('now', ? || ' hours'))
+            """,
+            (listing_id, seller_id, f"-{cooldown_hours}"),
+        )
+        conn.commit()
+    return cur.rowcount > 0
+
+
 def get_active_listings(guild_id: int, category: str = None):
+    """Return active listings, most-recently-bumped (or created) first."""
     with get_connection() as conn:
         _ensure_listings_tables(conn)
         if category:
             return conn.execute("""
                 SELECT * FROM listings
                 WHERE guild_id=? AND status='active' AND category=?
-                ORDER BY created_at DESC
+                ORDER BY COALESCE(bumped_at, created_at) DESC
             """, (guild_id, category)).fetchall()
         return conn.execute("""
             SELECT * FROM listings
             WHERE guild_id=? AND status='active'
-            ORDER BY created_at DESC
+            ORDER BY COALESCE(bumped_at, created_at) DESC
         """, (guild_id,)).fetchall()
 
 

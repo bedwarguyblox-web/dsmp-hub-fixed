@@ -34,6 +34,7 @@ from utils.database import (
     add_vouch, add_scam_vouch, remove_scam_vouch, get_vouch_counts,
     # listing helpers (new)
     create_listing, get_listing, update_listing, atomic_claim_listing,
+    atomic_bump_claim,
     get_active_listings, get_user_listings, get_listing_history,
     get_expired_active_listings,
     set_user_ign, get_user_ign,
@@ -62,7 +63,9 @@ DURATIONS = {
     "2 days":    2 * 24 * 60 * 60_000,
     "3 days":    3 * 24 * 60 * 60_000,
 }
-PREVIEW_TIMEOUT = 120  # seconds
+PREVIEW_TIMEOUT = 120          # seconds
+MAX_ACTIVE_LISTINGS = 5        # per-user cap on simultaneous active listings
+BUMP_COOLDOWN_HOURS = 24       # hours between bumps on the same listing
 
 # ── Config helpers ─────────────────────────────────────────────────────────────
 
@@ -831,6 +834,9 @@ class ListingsCog(commands.Cog, name="Listings"):
         elif cid.startswith("listing_watch_"):
             listing_id = cid[len("listing_watch_"):]
             await self._handle_watch(interaction, listing_id)
+        elif cid.startswith("listing_bump_"):
+            listing_id = cid[len("listing_bump_"):]
+            await self._handle_bump(interaction, listing_id)
 
         # Cancel — confirm/abort BEFORE generic listing_cancel_
         elif cid.startswith("listing_cancelconfirm_"):
@@ -1198,6 +1204,19 @@ class ListingsCog(commands.Cog, name="Listings"):
         listing_id = data["listing_id"]
         ends_at    = None
 
+        # ── Spam protection: cap active listings per user ─────────────────────
+        active = get_user_listings(interaction.user.id, guild_id, status="active")
+        if len(active) >= MAX_ACTIVE_LISTINGS:
+            await interaction.response.edit_message(
+                content=(
+                    f"❌ You already have **{len(active)}** active listing(s). "
+                    f"The maximum is **{MAX_ACTIVE_LISTINGS}**. "
+                    "Close or sell an existing listing before posting a new one."
+                ),
+                embed=None, view=None,
+            )
+            return
+
         if data["type"] == "bidding":
             dur_ms  = data.get("duration_ms", 3600_000)
             ends_at = (datetime.now(timezone.utc) + timedelta(milliseconds=dur_ms)).strftime("%Y-%m-%d %H:%M:%S")
@@ -1342,6 +1361,10 @@ class ListingsCog(commands.Cog, name="Listings"):
         view.add_item(discord.ui.Button(
             label="👁️ Watch", style=discord.ButtonStyle.secondary,
             custom_id=f"listing_watch_{listing_id}", row=1,
+        ))
+        view.add_item(discord.ui.Button(
+            label="🚀 Bump", style=discord.ButtonStyle.secondary,
+            custom_id=f"listing_bump_{listing_id}", row=1,
         ))
         view.add_item(discord.ui.Button(
             label="🚫 Cancel Listing", style=discord.ButtonStyle.danger,
@@ -1930,6 +1953,108 @@ class ListingsCog(commands.Cog, name="Listings"):
         await interaction.response.send_message(
             "👁️ You'll be notified of updates on this listing.", ephemeral=True
         )
+
+    # ── Bump Listing ───────────────────────────────────────────────────────────
+
+    async def _handle_bump(self, interaction: discord.Interaction, listing_id: str):
+        row = get_listing(listing_id)
+        if not row or row["status"] != "active":
+            await interaction.response.send_message("This listing is no longer active.", ephemeral=True)
+            return
+        if row["seller_id"] != interaction.user.id:
+            await interaction.response.send_message(
+                "Only the seller can bump this listing.", ephemeral=True
+            )
+            return
+
+        # ── Step 1: Validate target channel BEFORE any destructive action ─────
+        listing_ch_id = _lcfg(interaction.guild_id, "channel_id")
+        if not listing_ch_id:
+            await interaction.response.send_message(
+                "❌ Listings channel not configured. Ask an admin to run `/listingadmin setlistingchannel`.",
+                ephemeral=True,
+            )
+            return
+        listing_ch = interaction.guild.get_channel(int(listing_ch_id))
+        if not listing_ch:
+            await interaction.response.send_message(
+                "❌ Listings channel not found.", ephemeral=True
+            )
+            return
+
+        # ── Step 2: Atomic claim — sets bumped_at in a single UPDATE ─────────
+        # Prevents two simultaneous taps from both succeeding (race condition fix).
+        # Returns False if listing is inactive, wrong seller, or cooldown not elapsed.
+        claimed = atomic_bump_claim(listing_id, interaction.user.id, BUMP_COOLDOWN_HOURS)
+        if not claimed:
+            # Re-read to determine why (cooldown vs. listing gone/not owned)
+            fresh = get_listing(listing_id)
+            if not fresh or fresh["status"] != "active":
+                await interaction.response.send_message("This listing is no longer active.", ephemeral=True)
+                return
+            # Must be cooldown elapsed — compute remaining and show it
+            remaining_msg = "⏳ You can bump this listing again in less than an hour."
+            try:
+                bumped_at_raw = fresh["bumped_at"]
+                if bumped_at_raw:
+                    last_bump  = datetime.strptime(bumped_at_raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    remaining  = timedelta(hours=BUMP_COOLDOWN_HOURS) - (datetime.now(timezone.utc) - last_bump)
+                    total_secs = max(0, int(remaining.total_seconds()))
+                    hrs, rem   = divmod(total_secs, 3600)
+                    mins       = rem // 60
+                    remaining_msg = (
+                        f"⏳ You can bump **{fresh['item_name']}** again in "
+                        f"**{hrs}h {mins}m**."
+                    )
+            except Exception:
+                pass  # fallback message is already set above
+            await interaction.response.send_message(remaining_msg, ephemeral=True)
+            return
+
+        # Bump was atomically claimed — bumped_at is now written in DB.
+        # Defer so we have time to send new message and delete old one.
+        await interaction.response.defer(ephemeral=True)
+
+        # ── Step 3: Send new message at bottom of channel ─────────────────────
+        old_channel_id = row["channel_id"]
+        old_message_id = row["message_id"]
+        try:
+            updated    = get_listing(listing_id)
+            live_embed = _build_listing_embed(dict(updated), interaction.guild)
+            live_view  = self._build_live_view(listing_id, row["type"])
+            new_msg    = await listing_ch.send(embed=live_embed, view=live_view)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            # Send failed — bump is still claimed so cooldown is consumed, but
+            # the old message remains visible so the listing is not lost.
+            logger.warning("Bump repost failed for %s: %s", listing_id, exc)
+            await interaction.followup.send(
+                "❌ Could not post the bumped listing — missing permissions? The bump cooldown has been used.",
+                ephemeral=True,
+            )
+            return
+
+        # ── Step 4: Update DB with new message pointer ────────────────────────
+        update_listing(listing_id, message_id=new_msg.id, channel_id=listing_ch.id)
+
+        # ── Step 5: Delete old message (best-effort, non-destructive) ─────────
+        if old_channel_id and old_message_id:
+            try:
+                old_ch  = interaction.guild.get_channel(old_channel_id) or await interaction.guild.fetch_channel(old_channel_id)
+                old_msg = await old_ch.fetch_message(old_message_id)
+                await old_msg.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass  # already gone or no permission — listing is still fine
+
+        await interaction.followup.send("🚀 Listing bumped to the bottom!", ephemeral=True)
+
+        # ── Log ───────────────────────────────────────────────────────────────
+        log_ch_id = _lcfg(interaction.guild_id, "log_channel_id")
+        await self._post_log(interaction.guild, log_ch_id, "🚀 Listing Bumped", discord.Color.blurple(), [
+            ("Item",       row["item_name"],           True),
+            ("Seller",     interaction.user.mention,   True),
+            ("Listing ID", listing_id,                 True),
+            ("Timestamp",  datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), False),
+        ])
 
     # ── Cancel Listing ─────────────────────────────────────────────────────────
 
