@@ -1,0 +1,3 @@
+- [Listings cog routing rules](listings-routing.md) — on_interaction custom_id branches must order specific prefixes before generic ones to avoid ValueError crashes.
+- [Listings timestamp format](listings-timestamps.md) — ends_at stored as SQLite-compatible "%Y-%m-%d %H:%M:%S" UTC; .isoformat() breaks datetime('now') text comparison.
+- [Listings atomic state transitions](listings-atomic.md) — buy/offer-accept/counter-accept use atomic_claim_listing() to prevent double-sell race conditions.

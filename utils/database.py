@@ -1076,3 +1076,265 @@ def cancel_giveaway(message_id: int) -> bool:
         )
         conn.commit()
     return cur.rowcount > 0
+
+
+# ── Listings system ───────────────────────────────────────────────────────────
+
+def _ensure_listings_tables(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS listings (
+            listing_id      TEXT    NOT NULL UNIQUE,
+            guild_id        INTEGER NOT NULL,
+            seller_id       INTEGER NOT NULL,
+            item_name       TEXT    NOT NULL,
+            description     TEXT,
+            quantity        TEXT    NOT NULL,
+            category        TEXT    NOT NULL,
+            type            TEXT    NOT NULL,
+            buy_now_price   TEXT,
+            starting_bid    TEXT,
+            current_bid     TEXT,
+            current_bidder  INTEGER,
+            min_increment   TEXT,
+            reserve_price   TEXT,
+            duration_ms     INTEGER,
+            created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+            ends_at         TEXT,
+            status          TEXT    NOT NULL DEFAULT 'active',
+            message_id      INTEGER,
+            channel_id      INTEGER,
+            bid_history     TEXT    NOT NULL DEFAULT '[]',
+            watchers        TEXT    NOT NULL DEFAULT '[]'
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS listing_users (
+            discord_id  INTEGER PRIMARY KEY,
+            ign         TEXT    NOT NULL,
+            updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS listing_transactions (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            listing_id      TEXT    NOT NULL,
+            guild_id        INTEGER NOT NULL,
+            buyer_id        INTEGER NOT NULL,
+            seller_id       INTEGER NOT NULL,
+            ticket_channel_id INTEGER NOT NULL UNIQUE,
+            final_price     TEXT,
+            status          TEXT    NOT NULL DEFAULT 'open',
+            deal_confirmed_by TEXT  NOT NULL DEFAULT '[]',
+            scam_reporter_id  INTEGER,
+            scam_accused_id   INTEGER,
+            created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS listing_ratings (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            rater_id    INTEGER NOT NULL,
+            rated_id    INTEGER NOT NULL,
+            listing_id  TEXT    NOT NULL,
+            stars       INTEGER NOT NULL,
+            timestamp   TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(rater_id, listing_id)
+        )
+    """)
+
+
+def create_listing(listing_id: str, guild_id: int, seller_id: int, item_name: str,
+                   description: str, quantity: str, category: str, listing_type: str,
+                   buy_now_price: str = None, starting_bid: str = None,
+                   min_increment: str = None, reserve_price: str = None,
+                   duration_ms: int = None, ends_at: str = None):
+    with get_connection() as conn:
+        _ensure_listings_tables(conn)
+        conn.execute("""
+            INSERT INTO listings
+                (listing_id, guild_id, seller_id, item_name, description, quantity,
+                 category, type, buy_now_price, starting_bid, min_increment,
+                 reserve_price, duration_ms, ends_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (listing_id, guild_id, seller_id, item_name, description, quantity,
+              category, listing_type, buy_now_price, starting_bid, min_increment,
+              reserve_price, duration_ms, ends_at))
+        conn.commit()
+
+
+def get_listing(listing_id: str):
+    with get_connection() as conn:
+        _ensure_listings_tables(conn)
+        return conn.execute(
+            "SELECT * FROM listings WHERE listing_id=?", (listing_id,)
+        ).fetchone()
+
+
+def update_listing(listing_id: str, **fields):
+    if not fields:
+        return
+    set_clause = ", ".join(f"{k}=?" for k in fields)
+    values = list(fields.values()) + [listing_id]
+    with get_connection() as conn:
+        _ensure_listings_tables(conn)
+        conn.execute(f"UPDATE listings SET {set_clause} WHERE listing_id=?", values)
+        conn.commit()
+
+
+def atomic_claim_listing(listing_id: str, new_status: str) -> bool:
+    """Atomically transition a listing from 'active' to new_status.
+    Returns True if the update succeeded (listing was active), False otherwise.
+    This prevents double-sell race conditions."""
+    with get_connection() as conn:
+        _ensure_listings_tables(conn)
+        cur = conn.execute(
+            "UPDATE listings SET status=? WHERE listing_id=? AND status='active'",
+            (new_status, listing_id)
+        )
+        conn.commit()
+    return cur.rowcount > 0
+
+
+def get_active_listings(guild_id: int, category: str = None):
+    with get_connection() as conn:
+        _ensure_listings_tables(conn)
+        if category:
+            return conn.execute("""
+                SELECT * FROM listings
+                WHERE guild_id=? AND status='active' AND category=?
+                ORDER BY created_at DESC
+            """, (guild_id, category)).fetchall()
+        return conn.execute("""
+            SELECT * FROM listings
+            WHERE guild_id=? AND status='active'
+            ORDER BY created_at DESC
+        """, (guild_id,)).fetchall()
+
+
+def get_user_listings(seller_id: int, guild_id: int, status: str = None):
+    with get_connection() as conn:
+        _ensure_listings_tables(conn)
+        if status:
+            return conn.execute("""
+                SELECT * FROM listings
+                WHERE seller_id=? AND guild_id=? AND status=?
+                ORDER BY created_at DESC
+            """, (seller_id, guild_id, status)).fetchall()
+        return conn.execute("""
+            SELECT * FROM listings
+            WHERE seller_id=? AND guild_id=?
+            ORDER BY created_at DESC
+        """, (seller_id, guild_id)).fetchall()
+
+
+def get_listing_history(guild_id: int, user_id: int = None, limit: int = 20, offset: int = 0):
+    with get_connection() as conn:
+        _ensure_listings_tables(conn)
+        if user_id:
+            return conn.execute("""
+                SELECT * FROM listings
+                WHERE guild_id=? AND seller_id=? AND status IN ('sold','expired','cancelled')
+                ORDER BY created_at DESC LIMIT ? OFFSET ?
+            """, (guild_id, user_id, limit, offset)).fetchall()
+        return conn.execute("""
+            SELECT * FROM listings
+            WHERE guild_id=? AND status IN ('sold','expired','cancelled')
+            ORDER BY created_at DESC LIMIT ? OFFSET ?
+        """, (guild_id, limit, offset)).fetchall()
+
+
+def get_expired_active_listings():
+    """Return bidding listings whose ends_at has passed and are still active."""
+    with get_connection() as conn:
+        _ensure_listings_tables(conn)
+        return conn.execute("""
+            SELECT * FROM listings
+            WHERE status='active' AND type='bidding' AND ends_at IS NOT NULL
+              AND ends_at <= datetime('now')
+        """).fetchall()
+
+
+def set_user_ign(discord_id: int, ign: str):
+    with get_connection() as conn:
+        _ensure_listings_tables(conn)
+        conn.execute("""
+            INSERT INTO listing_users (discord_id, ign, updated_at)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(discord_id) DO UPDATE SET ign=excluded.ign, updated_at=excluded.updated_at
+        """, (discord_id, ign))
+        conn.commit()
+
+
+def get_user_ign(discord_id: int) -> str | None:
+    with get_connection() as conn:
+        _ensure_listings_tables(conn)
+        row = conn.execute(
+            "SELECT ign FROM listing_users WHERE discord_id=?", (discord_id,)
+        ).fetchone()
+    return row["ign"] if row else None
+
+
+def create_listing_transaction(listing_id: str, guild_id: int, buyer_id: int,
+                                seller_id: int, ticket_channel_id: int,
+                                final_price: str = None) -> bool:
+    try:
+        with get_connection() as conn:
+            _ensure_listings_tables(conn)
+            conn.execute("""
+                INSERT INTO listing_transactions
+                    (listing_id, guild_id, buyer_id, seller_id, ticket_channel_id, final_price)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (listing_id, guild_id, buyer_id, seller_id, ticket_channel_id, final_price))
+            conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def get_transaction_by_channel(channel_id: int):
+    with get_connection() as conn:
+        _ensure_listings_tables(conn)
+        return conn.execute(
+            "SELECT * FROM listing_transactions WHERE ticket_channel_id=?", (channel_id,)
+        ).fetchone()
+
+
+def update_transaction(ticket_channel_id: int, **fields):
+    if not fields:
+        return
+    set_clause = ", ".join(f"{k}=?" for k in fields)
+    values = list(fields.values()) + [ticket_channel_id]
+    with get_connection() as conn:
+        _ensure_listings_tables(conn)
+        conn.execute(
+            f"UPDATE listing_transactions SET {set_clause} WHERE ticket_channel_id=?", values
+        )
+        conn.commit()
+
+
+def add_listing_rating(rater_id: int, rated_id: int, listing_id: str, stars: int) -> bool:
+    """Returns True if new rating saved, False if already rated this listing."""
+    try:
+        with get_connection() as conn:
+            _ensure_listings_tables(conn)
+            conn.execute("""
+                INSERT INTO listing_ratings (rater_id, rated_id, listing_id, stars)
+                VALUES (?, ?, ?, ?)
+            """, (rater_id, rated_id, listing_id, stars))
+            conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def get_user_avg_rating(user_id: int) -> tuple[float, int]:
+    """Returns (avg_stars, count). avg_stars is 0.0 if no ratings."""
+    with get_connection() as conn:
+        _ensure_listings_tables(conn)
+        row = conn.execute("""
+            SELECT AVG(stars) as avg, COUNT(*) as cnt
+            FROM listing_ratings WHERE rated_id=?
+        """, (user_id,)).fetchone()
+    if row and row["cnt"] > 0:
+        return round(row["avg"], 1), row["cnt"]
+    return 0.0, 0

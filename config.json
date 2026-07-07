@@ -23,6 +23,15 @@
     {"role_id": 1506881437746597898, "label": "Price Change Ping"},
     {"role_id": 1505977452847956028, "label": "Partnership Ping"}
   ],
+  "listingChannelId": "",
+  "listingPanelMessageId": "",
+  "ticketCategoryId": "",
+  "appealCategoryId": "",
+  "logChannelId": "",
+  "balanceApiUrl": "https://donutsmp.net/api/v1/balance/",
+  "adminRoleId": "",
+  "previewTimeoutSeconds": 120,
+  "ticketCloseDelayMs": 300000,
   "STAFF_ROLES": {
     "Helper":                   1510810554137182299,
     "Sr Helper":                1510810712711106681,
