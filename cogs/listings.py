@@ -3,7 +3,7 @@ listings.py — Full marketplace / listings panel system.
 
 Commands:
   /listingsetup          — Post permanent marketplace panel (Admin)
-  /setign [ign]          — Save your Minecraft IGN
+  Set IGN button         — Save your Minecraft IGN (panel button)
   /mylistings            — View your active listings
   /listinghistory        — View completed listing history
   /listingadmin …        — Admin config subcommands
@@ -36,7 +36,7 @@ from utils.database import (
     atomic_bump_claim,
     get_active_listings, get_user_listings, get_listing_history,
     get_expired_active_listings,
-    set_user_ign,
+    set_user_ign, get_user_ign,
     create_listing_transaction, get_transaction_by_channel, update_transaction,
     add_listing_rating, get_user_avg_rating,
     # guild config
@@ -194,7 +194,12 @@ def _build_listing_embed(data: dict, guild: discord.Guild, is_preview: bool = Fa
         color = discord.Color.blurple()
 
     title = f"📦 {item_name}"
-    embed = discord.Embed(title=title, color=color)
+    disclaimer = (
+        "-# ⚠️ This server is not liable for scams or damages. "
+        "We only facilitate listings — we cannot control others' intentions. "
+        "**Try not to go first** to avoid being scammed."
+    )
+    embed = discord.Embed(title=title, color=color, description=disclaimer)
 
     seller_mention = f"<@{seller_id}>" if seller_id else "Unknown"
     if not is_preview:
@@ -253,6 +258,33 @@ def _build_listing_embed(data: dict, guild: discord.Guild, is_preview: bool = Fa
     return embed
 
 # ── Modals ─────────────────────────────────────────────────────────────────────
+
+class SetIGNModal(discord.ui.Modal, title="Set Your Minecraft IGN"):
+    ign = discord.ui.TextInput(
+        label="In-Game Name",
+        placeholder="e.g. DrDonutt  (case-sensitive)",
+        min_length=1,
+        max_length=32,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ign = self.ign.value.strip()
+        if not ign:
+            await interaction.response.send_message(
+                "❌ IGN cannot be blank. Please enter your Minecraft username.",
+                ephemeral=True,
+            )
+            return
+        set_user_ign(interaction.user.id, ign)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="✅ IGN Saved",
+                description=f"Your IGN **{ign}** has been linked to your account.",
+                color=discord.Color.green(),
+            ),
+            ephemeral=True,
+        )
+
 
 class AuctionModal(discord.ui.Modal, title="Create Auction Listing"):
     item_name = discord.ui.TextInput(
@@ -759,6 +791,8 @@ class ListingsCog(commands.Cog, name="Listings"):
             await self._handle_panel_browse(interaction)
         elif cid == "listing_panel_my":
             await self._handle_panel_my(interaction)
+        elif cid == "listing_panel_setign":
+            await interaction.response.send_modal(SetIGNModal())
 
         # Type selection
         elif cid.startswith("listing_type_"):
@@ -913,6 +947,13 @@ class ListingsCog(commands.Cog, name="Listings"):
     # ── Panel: Create Listing ──────────────────────────────────────────────────
 
     async def _handle_panel_create(self, interaction: discord.Interaction):
+        if not get_user_ign(interaction.user.id):
+            await interaction.response.send_message(
+                "⚠️ You need to set your Minecraft IGN before creating a listing.\n"
+                "Use the **🎮 Set IGN** button on the marketplace panel.",
+                ephemeral=True,
+            )
+            return
         temp_id = self._make_temp_id(interaction.user.id)
         self._pending[temp_id] = {
             "user_id":  interaction.user.id,
@@ -1381,6 +1422,13 @@ class ListingsCog(commands.Cog, name="Listings"):
         if row["seller_id"] == interaction.user.id:
             await interaction.response.send_message("You cannot buy your own listing.", ephemeral=True)
             return
+        if not get_user_ign(interaction.user.id):
+            await interaction.response.send_message(
+                "⚠️ You need to set your Minecraft IGN before buying.\n"
+                "Use the **🎮 Set IGN** button on the marketplace panel.",
+                ephemeral=True,
+            )
+            return
         buy_now = row["buy_now_price"]
         if not buy_now:
             await interaction.response.send_message("This listing has no Buy Now price.", ephemeral=True)
@@ -1415,6 +1463,13 @@ class ListingsCog(commands.Cog, name="Listings"):
         if not row or row["status"] != "active":
             await interaction.response.edit_message(
                 content="This listing is no longer available.", embed=None, view=None
+            )
+            return
+
+        if not get_user_ign(interaction.user.id):
+            await interaction.response.edit_message(
+                content="⚠️ Set your IGN first using the **🎮 Set IGN** button on the marketplace panel.",
+                embed=None, view=None,
             )
             return
 
@@ -1496,6 +1551,13 @@ class ListingsCog(commands.Cog, name="Listings"):
         if row["seller_id"] == interaction.user.id:
             await interaction.response.send_message("You cannot offer on your own listing.", ephemeral=True)
             return
+        if not get_user_ign(interaction.user.id):
+            await interaction.response.send_message(
+                "⚠️ You need to set your Minecraft IGN before making an offer.\n"
+                "Use the **🎮 Set IGN** button on the marketplace panel.",
+                ephemeral=True,
+            )
+            return
         await interaction.response.send_modal(OfferModal(self, listing_id))
 
     async def _handle_offer_submit(self, interaction: discord.Interaction,
@@ -1503,6 +1565,12 @@ class ListingsCog(commands.Cog, name="Listings"):
         row = get_listing(listing_id)
         if not row or row["status"] != "active":
             await interaction.response.send_message("Listing no longer available.", ephemeral=True)
+            return
+        if not get_user_ign(interaction.user.id):
+            await interaction.response.send_message(
+                "⚠️ Set your IGN first using the **🎮 Set IGN** button on the marketplace panel.",
+                ephemeral=True,
+            )
             return
 
         try:
@@ -1744,6 +1812,13 @@ class ListingsCog(commands.Cog, name="Listings"):
         if row["seller_id"] == interaction.user.id:
             await interaction.response.send_message("You cannot bid on your own listing.", ephemeral=True)
             return
+        if not get_user_ign(interaction.user.id):
+            await interaction.response.send_message(
+                "⚠️ You need to set your Minecraft IGN before bidding.\n"
+                "Use the **🎮 Set IGN** button on the marketplace panel.",
+                ephemeral=True,
+            )
+            return
 
         current_bid = float(row["current_bid"] or row["starting_bid"] or 0)
         min_inc     = float(row["min_increment"] or 0)
@@ -1758,6 +1833,12 @@ class ListingsCog(commands.Cog, name="Listings"):
         row = get_listing(listing_id)
         if not row or row["status"] != "active":
             await interaction.response.send_message("Listing no longer available.", ephemeral=True)
+            return
+        if not get_user_ign(interaction.user.id):
+            await interaction.response.send_message(
+                "⚠️ Set your IGN first using the **🎮 Set IGN** button on the marketplace panel.",
+                ephemeral=True,
+            )
             return
 
         try:
@@ -2149,9 +2230,14 @@ class ListingsCog(commands.Cog, name="Listings"):
         )
         summary.add_field(name="Item",   value=listing_data.get("item_name", listing_id), inline=True)
         summary.add_field(name="Price",  value=f"${_fmt_price(final_price)}" if final_price else "Offer", inline=True)
-        summary.add_field(name="Buyer",  value=f"<@{buyer_id}>",  inline=True)
-        summary.add_field(name="Seller", value=f"<@{seller_id}>", inline=True)
-        summary.add_field(name="Qty",    value=listing_data.get("quantity", "?"), inline=True)
+        buyer_ign  = get_user_ign(buyer_id)  or "*(not set)*"
+        seller_ign = get_user_ign(seller_id) or "*(not set)*"
+        summary.add_field(name="Buyer",      value=f"<@{buyer_id}>",  inline=True)
+        summary.add_field(name="Buyer IGN",  value=buyer_ign,          inline=True)
+        summary.add_field(name="\u200b",     value="\u200b",           inline=True)
+        summary.add_field(name="Seller",     value=f"<@{seller_id}>", inline=True)
+        summary.add_field(name="Seller IGN", value=seller_ign,         inline=True)
+        summary.add_field(name="Qty",        value=listing_data.get("quantity", "?"), inline=True)
         summary.set_footer(text="Please complete the transaction and click Deal Done when finished.")
 
         mentions = " ".join(filter(None, [
@@ -2875,6 +2961,11 @@ class ListingsCog(commands.Cog, name="Listings"):
             style=discord.ButtonStyle.secondary,
             custom_id="listing_panel_my",
         ))
+        view.add_item(discord.ui.Button(
+            label="🎮 Set IGN",
+            style=discord.ButtonStyle.secondary,
+            custom_id="listing_panel_setign",
+        ))
 
         # Check if a panel already exists; edit it instead of reposting
         existing_id = _lcfg(interaction.guild_id, "panel_message_id")
@@ -2894,15 +2985,19 @@ class ListingsCog(commands.Cog, name="Listings"):
         _set_lcfg(interaction.guild_id, "channel_id", str(interaction.channel_id))
         await interaction.followup.send("✅ Marketplace panel posted!", ephemeral=True)
 
-    @app_commands.command(name="setign", description="Save your Minecraft IGN")
+
+    @app_commands.command(name="setign", description="Save your Minecraft IGN (also available as a panel button)")
     @app_commands.describe(ign="Your in-game name (case-sensitive)")
     async def setign(self, interaction: discord.Interaction, ign: str):
         ign = ign.strip()
+        if not ign:
+            await interaction.response.send_message("❌ IGN cannot be blank.", ephemeral=True)
+            return
         set_user_ign(interaction.user.id, ign)
         await interaction.response.send_message(
             embed=discord.Embed(
-                title="✅ IGN Registered",
-                description=f"IGN **{ign}** has been linked to your account.",
+                title="✅ IGN Saved",
+                description=f"Your IGN **{ign}** has been linked to your account.",
                 color=discord.Color.green(),
             ),
             ephemeral=True,
