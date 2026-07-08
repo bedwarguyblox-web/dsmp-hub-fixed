@@ -28,8 +28,6 @@
   "ticketCategoryId": "",
   "appealCategoryId": "",
   "logChannelId": "",
-  "balanceApiUrl": "https://api.donutsmp.net/v1/stats/",
-  "donutApiKey": "YOUR_DONUT_API_KEY_HERE",
   "adminRoleId": "",
   "previewTimeoutSeconds": 120,
   "ticketCloseDelayMs": 300000,

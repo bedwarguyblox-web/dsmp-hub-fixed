@@ -24,7 +24,6 @@ import string
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -37,7 +36,7 @@ from utils.database import (
     atomic_bump_claim,
     get_active_listings, get_user_listings, get_listing_history,
     get_expired_active_listings,
-    set_user_ign, get_user_ign,
+    set_user_ign,
     create_listing_transaction, get_transaction_by_channel, update_transaction,
     add_listing_rating, get_user_avg_rating,
     # guild config
@@ -1746,73 +1745,9 @@ class ListingsCog(commands.Cog, name="Listings"):
             await interaction.response.send_message("You cannot bid on your own listing.", ephemeral=True)
             return
 
-        # Check IGN
-        ign = get_user_ign(interaction.user.id)
-        if not ign:
-            await interaction.response.send_message(
-                "⚠️ Set your Minecraft IGN first with `/setign [name]`.",
-                ephemeral=True,
-            )
-            return
-
-        # Fetch balance from Donut SMP API (https://api.donutsmp.net/)
-        # Endpoint: GET /v1/stats/{user}  →  { "status": 200, "result": { "money": "12345", ... } }
-        # Auth:     Authorization: Bearer {donutApiKey}  (create key in-game with /api)
-        # 401 = missing/invalid key,  500 = player not found or server error
-        balance_api = BOT_CONFIG.get("balanceApiUrl", "https://api.donutsmp.net/v1/stats/")
-        api_key     = BOT_CONFIG.get("donutApiKey", "")
-        headers     = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-
         current_bid = float(row["current_bid"] or row["starting_bid"] or 0)
         min_inc     = float(row["min_increment"] or 0)
         min_next    = current_bid + min_inc if row["current_bid"] else float(row["starting_bid"] or 0)
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{balance_api}{ign}",
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as resp:
-                    if resp.status == 401:
-                        # API key not configured or invalid — log and allow bid through
-                        # (this is an admin config issue, not the user's fault)
-                        logger.warning(
-                            "Donut API returned 401 for IGN %s — is 'donutApiKey' set in config.json?", ign
-                        )
-                    elif resp.status == 500:
-                        # New API returns 500 for unknown players (no separate 404)
-                        api_data = await resp.json(content_type=None)
-                        logger.warning("Donut API 500 for IGN %s: %s", ign, api_data)
-                        await interaction.response.send_message(
-                            f"❌ Your IGN `{ign}` wasn't found on the server. "
-                            "Please double-check the spelling and update it with `/setign`.",
-                            ephemeral=True,
-                        )
-                        return
-                    elif resp.status == 200:
-                        api_data = await resp.json(content_type=None)
-                        # New API shape: { "status": 200, "result": { "money": "12345", ... } }
-                        raw_bal = api_data.get("result", {}).get("money")
-                        if raw_bal is not None:
-                            balance = float(raw_bal)
-                            if balance < min_next:
-                                await interaction.response.send_message(
-                                    f"❌ Insufficient balance. You need at least **${min_next:,.0f}** "
-                                    f"but your balance is **${balance:,.0f}**.",
-                                    ephemeral=True,
-                                )
-                                return
-                        else:
-                            logger.warning(
-                                "Donut API response missing result.money for IGN %s. Full response: %s",
-                                ign, api_data,
-                            )
-                    else:
-                        logger.warning("Donut API unexpected status %s for IGN %s", resp.status, ign)
-        except Exception as exc:
-            logger.warning("Donut API check failed for IGN %s: %s", ign, exc)
-            # API unavailable — allow bid without balance check
 
         await interaction.response.send_modal(
             BidModal(self, listing_id, f"{min_next:,.0f}")
@@ -2959,76 +2894,16 @@ class ListingsCog(commands.Cog, name="Listings"):
         _set_lcfg(interaction.guild_id, "channel_id", str(interaction.channel_id))
         await interaction.followup.send("✅ Marketplace panel posted!", ephemeral=True)
 
-    @app_commands.command(name="setign", description="Save your Minecraft IGN for bidding")
+    @app_commands.command(name="setign", description="Save your Minecraft IGN")
     @app_commands.describe(ign="Your in-game name (case-sensitive)")
     async def setign(self, interaction: discord.Interaction, ign: str):
-        await interaction.response.defer(ephemeral=True)
         ign = ign.strip()
         set_user_ign(interaction.user.id, ign)
-
-        # Immediately verify the IGN against the Donut SMP API so the user
-        # knows right away if they've mistyped their name.
-        # Endpoint: GET /v1/stats/{user}  (https://api.donutsmp.net/)
-        # Docs: https://api.donutsmp.net/index.html — create key in-game with /api
-        balance_api = BOT_CONFIG.get("balanceApiUrl", "https://api.donutsmp.net/v1/stats/")
-        api_key     = BOT_CONFIG.get("donutApiKey", "")
-        headers     = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        verify_line = ""
-        embed_color = discord.Color.green()
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{balance_api}{ign}",
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as resp:
-                    if resp.status == 200:
-                        api_data = await resp.json(content_type=None)
-                        # New API shape: { "status": 200, "result": { "money": "12345", ... } }
-                        raw_bal = api_data.get("result", {}).get("money")
-                        if raw_bal is not None:
-                            verify_line = (
-                                f"\n✅ Account verified — current balance: **${float(raw_bal):,.0f}**"
-                            )
-                        else:
-                            verify_line = "\n✅ Account found on the server."
-                    elif resp.status == 401:
-                        # API key not configured or invalid
-                        logger.warning(
-                            "Donut API returned 401 on setign verify for %s — is 'donutApiKey' set in config.json?", ign
-                        )
-                        verify_line = (
-                            "\n⚠️ Could not verify account — the bot's API key is not configured. "
-                            "Your IGN has been saved; ask an admin to set `donutApiKey` in config.json."
-                        )
-                        embed_color = discord.Color.orange()
-                    elif resp.status == 500:
-                        # New API returns 500 when the player is not found
-                        verify_line = (
-                            f"\n⚠️ **Player `{ign}` was not found on the server.** "
-                            "Double-check the spelling — IGN is case-sensitive."
-                        )
-                        embed_color = discord.Color.orange()
-                    else:
-                        verify_line = (
-                            f"\n⚠️ Could not verify account right now "
-                            f"(API status {resp.status}). Your IGN has been saved — "
-                            "if bids fail, run `/setign` again to re-check."
-                        )
-                        embed_color = discord.Color.orange()
-        except Exception as exc:
-            logger.warning("Donut API verify failed for IGN %s: %s", ign, exc)
-            verify_line = (
-                "\n⚠️ Balance API is unreachable right now — your IGN has been saved. "
-                "If bids fail, confirm your IGN is correct and try again."
-            )
-            embed_color = discord.Color.orange()
-
-        await interaction.followup.send(
+        await interaction.response.send_message(
             embed=discord.Embed(
                 title="✅ IGN Registered",
-                description=f"IGN **{ign}** has been linked to your account.{verify_line}",
-                color=embed_color,
+                description=f"IGN **{ign}** has been linked to your account.",
+                color=discord.Color.green(),
             ),
             ephemeral=True,
         )
