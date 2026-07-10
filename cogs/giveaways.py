@@ -90,13 +90,15 @@ class PersistentGiveawayView(discord.ui.View):
 class GiveawaysCog(commands.Cog, name="Giveaways"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._finished: dict[int, list[int]] = {}   # msg_id → entrant user IDs (for reroll)
-        self._active:   dict[int, asyncio.Task] = {} # msg_id → running task
+        self._finished:       dict[int, list[int]] = {}   # msg_id → entrant user IDs (for reroll)
+        self._active:         dict[int, asyncio.Task] = {} # msg_id → running task
+        self._staff_cancelled: set[int] = set()            # msg_ids explicitly cancelled via /giveawaycancel
 
     async def cog_load(self):
-        """Register persistent views on startup."""
+        """Register persistent views and re-schedule all active giveaway timers on startup."""
         active = get_active_giveaways()
         for gw in active:
+            # Re-register button views so interactions still work
             view = PersistentGiveawayView(
                 gw["giveaway_id"], gw["prize"], bool(gw["is_quickdrop"])
             )
@@ -106,8 +108,12 @@ class GiveawaysCog(commands.Cog, name="Giveaways"):
                 gw["giveaway_id"], gw["message_id"]
             )
 
+            # Re-create the end timer so the draw fires after restart
+            task = asyncio.create_task(self._resume_giveaway(dict(gw)))
+            self._active[gw["message_id"]] = task
+
         if active:
-            logger.info("Loaded %d active giveaways from database", len(active))
+            logger.info("Resumed %d active giveaway timer(s) from database", len(active))
 
     # ── Config helpers ────────────────────────────────────────────────────────
     def _ping_role(self, guild: discord.Guild) -> discord.Role | None:
@@ -115,6 +121,319 @@ class GiveawaysCog(commands.Cog, name="Giveaways"):
         if raw:
             return guild.get_role(int(raw))
         return None
+
+    # ── Shared cancellation helper ────────────────────────────────────────────
+    async def _cancel_giveaway_embed(
+        self,
+        msg: discord.Message,
+        giveaway_id: str,
+        prize: str,
+        is_quickdrop: bool,
+        kind_tag: str,
+        host_name: str,
+    ):
+        """Edit the embed to cancelled state and mark the DB. Safe to call from any task."""
+        view = PersistentGiveawayView(giveaway_id, prize, is_quickdrop)
+        view.disable()
+        cancelled_embed = discord.Embed(
+            title=f"🚫 {kind_tag} CANCELLED — {prize}",
+            description=(
+                f"**Prize:** {prize}\n"
+                f"**Entries at cancellation:** {get_giveaway_entry_count(giveaway_id)}\n\n"
+                "This giveaway was cancelled by a staff member. No winner was drawn."
+            ),
+            color=discord.Color.dark_red(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        cancelled_embed.set_footer(text=f"Hosted by {host_name} • Cancelled")
+        try:
+            await msg.edit(embed=cancelled_embed, view=view)
+        except discord.NotFound:
+            pass
+        end_giveaway(giveaway_id, 'cancelled')
+
+    # ── Shared draw logic ─────────────────────────────────────────────────────
+    async def _finish_giveaway(
+        self,
+        msg: discord.Message,
+        giveaway_id: str,
+        guild: discord.Guild,
+        channel: discord.abc.Messageable,
+        host,            # discord.Member | discord.User | None
+        prize: str,
+        num_winners: int,
+        is_quickdrop: bool,
+        kind_tag: str,
+    ):
+        """
+        Pick winners, edit the giveaway embed to show results, post the
+        winner announcement, DM each winner, and mark the giveaway ended in DB.
+        Wrapped in try/except so any failure is logged rather than silently lost.
+        """
+        try:
+            # Atomic guard: transition active → ended right now.
+            # Only one concurrent caller can win; the other sees rowcount=0 and aborts.
+            # This also catches cancellations that raced with the sleep completing.
+            if not end_giveaway(giveaway_id, 'ended'):
+                logger.info(
+                    "Giveaway %s already ended/cancelled — skipping draw", giveaway_id
+                )
+                return
+
+            entries     = get_giveaway_entries(giveaway_id)
+            entrant_ids = [e["user_id"] for e in entries]
+            self._finished[msg.id] = entrant_ids  # keep for /rerollgiveaway
+
+            entrants = [m for uid in entrant_ids if (m := guild.get_member(uid)) and not m.bot]
+
+            actual_winners = min(num_winners, len(entrants))
+            if entrants:
+                winners        = random.sample(entrants, actual_winners)
+                winner_mentions = ", ".join(w.mention for w in winners)
+                win_text        = f"🏆 **Winner{'s' if actual_winners > 1 else ''}:** {winner_mentions}"
+            else:
+                winners         = []
+                winner_mentions = ""
+                win_text        = "😢 Nobody entered — no winners this time!"
+
+            host_name = host.display_name if host else "Unknown"
+
+            # Edit original embed to show winner(s)
+            view = PersistentGiveawayView(giveaway_id, prize, is_quickdrop)
+            view.disable()
+            ended_embed = discord.Embed(
+                title=f"{kind_tag} ENDED — {prize}",
+                description=(
+                    f"**Prize:** {prize}\n"
+                    f"**Total Entries:** {len(entrant_ids)}\n\n"
+                    f"{win_text}"
+                ),
+                color=discord.Color.dark_grey(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            ended_embed.set_footer(text=f"Hosted by {host_name} • Ended")
+
+            try:
+                await msg.edit(embed=ended_embed, view=view)
+            except discord.NotFound:
+                logger.warning("Giveaway %s: message deleted before update", giveaway_id)
+
+            host_ref = host.mention if host else "the host"
+
+            if winners:
+                # Public announcement
+                await channel.send(
+                    content=winner_mentions,
+                    embed=discord.Embed(
+                        title=f"🎉 Congratulations {winner_mentions}!",
+                        description=(
+                            f"You won **{prize}**!\n\n"
+                            f"Contact {host_ref} to claim your prize."
+                        ),
+                        color=discord.Color.gold(),
+                        timestamp=datetime.now(timezone.utc),
+                    ),
+                    allowed_mentions=discord.AllowedMentions(users=True),
+                )
+
+                # DM each winner
+                for winner in winners:
+                    try:
+                        await winner.send(embed=discord.Embed(
+                            title="🎉 You won a giveaway!",
+                            description=(
+                                f"You won **{prize}** in the **{guild.name}** "
+                                f"{'quickdrop' if is_quickdrop else 'giveaway'}!\n\n"
+                                f"Contact {host_ref} to claim your prize."
+                            ),
+                            color=discord.Color.gold(),
+                            timestamp=datetime.now(timezone.utc),
+                        ))
+                    except discord.Forbidden:
+                        logger.info(
+                            "Giveaway %s: could not DM winner %s — DMs closed",
+                            giveaway_id, winner,
+                        )
+            else:
+                await channel.send(
+                    embed=discord.Embed(
+                        title="😔 No one entered this giveaway.",
+                        description=(
+                            f"Nobody entered the {'quickdrop' if is_quickdrop else 'giveaway'} "
+                            f"for **{prize}**."
+                        ),
+                        color=discord.Color.dark_grey(),
+                        timestamp=datetime.now(timezone.utc),
+                    )
+                )
+
+            logger.info(
+                "Giveaway %s ended — prize: %s, winners: %s",
+                giveaway_id, prize,
+                [w.id for w in winners] if winners else "none",
+            )
+
+        except Exception:
+            logger.exception("Error finishing giveaway %s", giveaway_id)
+
+    # ── Resume active giveaways after restart ─────────────────────────────────
+    async def _resume_giveaway(self, gw: dict):
+        """
+        Re-attach a single active giveaway after a bot restart.
+        Computes how much time remains, waits that long, then draws.
+        If the end time already passed, draws immediately.
+        """
+        giveaway_id  = gw["giveaway_id"]
+        message_id   = gw["message_id"]
+        channel_id   = gw["channel_id"]
+        guild_id     = gw["guild_id"]
+        host_id      = gw["host_id"]
+        prize        = gw["prize"]
+        end_mode     = gw["end_mode"]
+        end_value    = gw["end_value"]   # seconds (for "time") or member count (for "members")
+        num_winners  = gw["num_winners"]
+        is_quickdrop = bool(gw["is_quickdrop"])
+        kind_tag     = "⚡ QUICKDROP" if is_quickdrop else "🎉 GIVEAWAY"
+
+        try:
+            await self.bot.wait_until_ready()
+
+            guild = self.bot.get_guild(guild_id)
+            if not guild:
+                logger.warning("Giveaway %s: guild %d not found on resume", giveaway_id, guild_id)
+                return
+
+            channel = guild.get_channel(channel_id)
+            if channel is None:
+                try:
+                    channel = await guild.fetch_channel(channel_id)
+                except (discord.NotFound, discord.Forbidden):
+                    logger.warning(
+                        "Giveaway %s: channel %d not found — marking ended",
+                        giveaway_id, channel_id,
+                    )
+                    end_giveaway(giveaway_id, 'ended')
+                    return
+
+            try:
+                msg = await channel.fetch_message(message_id)
+            except (discord.NotFound, discord.Forbidden):
+                logger.warning(
+                    "Giveaway %s: message %d not found — marking ended",
+                    giveaway_id, message_id,
+                )
+                end_giveaway(giveaway_id, 'ended')
+                return
+
+            # Host may have left the server; fall back to a plain User object
+            host = guild.get_member(host_id)
+            if host is None:
+                try:
+                    host = await self.bot.fetch_user(host_id)
+                except (discord.NotFound, discord.HTTPException):
+                    host = None
+
+            host_name = host.display_name if host else "Unknown"
+
+            if end_mode == "time":
+                # Compute remaining seconds from stored created_at + duration
+                created_at_str = gw.get("created_at", "")
+                try:
+                    created_at = datetime.strptime(
+                        created_at_str, "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=timezone.utc)
+                except ValueError:
+                    # Fallback: draw immediately if we can't parse the timestamp
+                    created_at = datetime.now(timezone.utc)
+                    end_value  = 0
+
+                end_at    = created_at.timestamp() + end_value
+                remaining = end_at - datetime.now(timezone.utc).timestamp()
+
+                if remaining <= 0:
+                    logger.info(
+                        "Giveaway %s expired during downtime (%.0fs ago) — drawing now",
+                        giveaway_id, -remaining,
+                    )
+                    await self._finish_giveaway(
+                        msg, giveaway_id, guild, channel, host,
+                        prize, num_winners, is_quickdrop, kind_tag,
+                    )
+                    return
+
+                logger.info(
+                    "Giveaway %s resumed — %.0fs remaining", giveaway_id, remaining
+                )
+                try:
+                    await asyncio.sleep(remaining)
+                except asyncio.CancelledError:
+                    if message_id in self._staff_cancelled:
+                        self._staff_cancelled.discard(message_id)
+                        await self._cancel_giveaway_embed(
+                            msg, giveaway_id, prize, is_quickdrop, kind_tag, host_name
+                        )
+                    return
+
+            else:
+                # Member-goal mode: resume polling
+                elapsed = 0
+                cancelled = False
+                while elapsed < MEMBER_GOAL_MAX_SECONDS:
+                    if (guild.member_count or 0) >= end_value:
+                        break
+                    try:
+                        await asyncio.sleep(MEMBER_GOAL_POLL_INTERVAL)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                        break
+                    elapsed += MEMBER_GOAL_POLL_INTERVAL
+                if cancelled:
+                    if message_id in self._staff_cancelled:
+                        self._staff_cancelled.discard(message_id)
+                        await self._cancel_giveaway_embed(
+                            msg, giveaway_id, prize, is_quickdrop, kind_tag, host_name
+                        )
+                    return
+
+            await self._finish_giveaway(
+                msg, giveaway_id, guild, channel, host,
+                prize, num_winners, is_quickdrop, kind_tag,
+            )
+
+        except asyncio.CancelledError:
+            # Task was cancelled during setup (wait_until_ready / channel or
+            # message fetch) before reaching the inner sleep/poll handlers.
+            # Only act if this was an explicit staff cancel — system-level
+            # cancellations (shutdown/cog reload) must not mutate DB or embed
+            # so the giveaway is resumed correctly on the next restart.
+            if message_id in self._staff_cancelled:
+                self._staff_cancelled.discard(message_id)
+                try:
+                    g = self.bot.get_guild(guild_id)
+                    if g:
+                        ch = g.get_channel(channel_id)
+                        if ch is None:
+                            try:
+                                ch = await g.fetch_channel(channel_id)
+                            except Exception:
+                                ch = None
+                        if ch:
+                            m = await ch.fetch_message(message_id)
+                            h = g.get_member(host_id)
+                            await self._cancel_giveaway_embed(
+                                m, giveaway_id, prize, is_quickdrop, kind_tag,
+                                h.display_name if h else "Unknown",
+                            )
+                except Exception:
+                    logger.debug(
+                        "Giveaway %s: could not update embed on setup-phase cancel",
+                        giveaway_id,
+                    )
+        except Exception:
+            logger.exception("Unhandled error resuming giveaway %s", giveaway_id)
+        finally:
+            self._active.pop(message_id, None)
+            self._staff_cancelled.discard(message_id)  # clean up any stale entry
 
     # ── Background wait-and-draw task ─────────────────────────────────────────
     async def _wait_and_draw(
@@ -143,96 +462,26 @@ class GiveawaysCog(commands.Cog, name="Giveaways"):
                     elapsed += MEMBER_GOAL_POLL_INTERVAL
 
         except asyncio.CancelledError:
-            # ── Cancelled by /giveawaycancel ─────────────────────────────────
-            view = PersistentGiveawayView(giveaway_id, prize, is_quickdrop)
-            view.disable()
-            cancelled_embed = discord.Embed(
-                title=f"🚫 {kind_tag} CANCELLED — {prize}",
-                description=(
-                    f"**Prize:** {prize}\n"
-                    f"**Entries at cancellation:** {get_giveaway_entry_count(giveaway_id)}\n\n"
-                    "This giveaway was cancelled by a staff member. No winner was drawn."
-                ),
-                color=discord.Color.dark_red(),
-                timestamp=datetime.now(timezone.utc),
-            )
-            cancelled_embed.set_footer(text=f"Hosted by {host.display_name} • Cancelled")
-            try:
-                await msg.edit(embed=cancelled_embed, view=view)
-            except discord.NotFound:
-                pass
-            end_giveaway(giveaway_id, 'cancelled')
+            # ── Cancelled by /giveawaycancel (or system shutdown/reload) ─────
+            # Only update embed + DB when a staff member explicitly requested
+            # the cancel; system-level cancellations leave state untouched so
+            # the giveaway is picked up correctly on the next restart.
+            if msg.id in self._staff_cancelled:
+                await self._cancel_giveaway_embed(
+                    msg, giveaway_id, prize, is_quickdrop, kind_tag,
+                    host.display_name if host else "Unknown",
+                )
             return
 
         finally:
             self._active.pop(msg.id, None)
+            self._staff_cancelled.discard(msg.id)  # clean up any stale entry
 
-        # ── Normal end: collect entrants and draw ─────────────────────────────
-        entries = get_giveaway_entries(giveaway_id)
-        entrant_ids = [e["user_id"] for e in entries]
-        self._finished[msg.id] = entrant_ids  # for reroll
-
-        entrants = [m for uid in entrant_ids if (m := guild.get_member(uid)) and not m.bot]
-
-        actual_winners = min(num_winners, len(entrants))
-        if entrants:
-            winners = random.sample(entrants, actual_winners)
-            winner_mentions = ", ".join(w.mention for w in winners)
-            win_text = f"🏆 **Winner{'s' if actual_winners > 1 else ''}:** {winner_mentions}"
-        else:
-            winners = []
-            winner_mentions = ""
-            win_text = "😢 Nobody entered — no winners this time!"
-
-        extra = f"**Server Members at Draw:** {guild.member_count:,}\n" if end_mode == "members" else ""
-
-        view = PersistentGiveawayView(giveaway_id, prize, is_quickdrop)
-        view.disable()
-        ended_embed = discord.Embed(
-            title=f"{kind_tag} ENDED — {prize}",
-            description=(
-                f"**Prize:** {prize}\n"
-                f"**Total Entries:** {len(entrant_ids)}\n"
-                f"{extra}\n"
-                f"{win_text}"
-            ),
-            color=discord.Color.dark_grey(),
-            timestamp=datetime.now(timezone.utc),
+        # ── Normal end: delegate to shared draw logic ─────────────────────────
+        await self._finish_giveaway(
+            msg, giveaway_id, guild, channel, host,
+            prize, num_winners, is_quickdrop, kind_tag,
         )
-        ended_embed.set_footer(text=f"Hosted by {host.display_name} • Ended")
-
-        try:
-            await msg.edit(embed=ended_embed, view=view)
-        except discord.NotFound:
-            logger.warning("Giveaway message deleted before update.")
-            return
-
-        end_giveaway(giveaway_id, 'ended')
-
-        if winners:
-            await channel.send(
-                content=winner_mentions,
-                embed=discord.Embed(
-                    title=f"🏆 {'Quickdrop' if is_quickdrop else 'Giveaway'} Winner{'s' if actual_winners > 1 else ''}!",
-                    description=(
-                        f"Congratulations {winner_mentions}!\n"
-                        f"You won **{prize}**!\n\n"
-                        f"Contact {host.mention} to claim your prize."
-                    ),
-                    color=discord.Color.gold(),
-                    timestamp=datetime.now(timezone.utc),
-                ),
-                allowed_mentions=discord.AllowedMentions(users=True),
-            )
-        else:
-            await channel.send(
-                embed=discord.Embed(
-                    title="😢 No Winners",
-                    description=f"Nobody entered the {'quickdrop' if is_quickdrop else 'giveaway'} for **{prize}**.",
-                    color=discord.Color.dark_grey(),
-                    timestamp=datetime.now(timezone.utc),
-                )
-            )
 
     # ── Core runner ───────────────────────────────────────────────────────────
     async def _run(
@@ -432,6 +681,25 @@ class GiveawaysCog(commands.Cog, name="Giveaways"):
         # Check in-memory active tasks first
         task = self._active.get(mid)
         if task and not task.done():
+            # Atomically mark cancelled in DB first.  If it returns False the
+            # giveaway already ended (drew winners) — tell the user and bail.
+            if not cancel_giveaway(mid):
+                await interaction.response.send_message(
+                    embed=discord.Embed(
+                        title="❌ Already Ended",
+                        description=(
+                            f"Giveaway `{mid}` already ended or was cancelled "
+                            "before the cancel could be applied."
+                        ),
+                        color=discord.Color.orange(),
+                        timestamp=datetime.now(timezone.utc),
+                    ),
+                    ephemeral=True,
+                )
+                return
+            # Record staff intent so the CancelledError handler knows this
+            # is a user-requested cancel, not a system shutdown/reload.
+            self._staff_cancelled.add(mid)
             task.cancel()
             await interaction.response.send_message(
                 embed=discord.Embed(

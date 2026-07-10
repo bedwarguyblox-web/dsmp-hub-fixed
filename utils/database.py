@@ -1056,14 +1056,20 @@ def get_giveaway_entry_count(giveaway_id: str) -> int:
     return row["c"] if row else 0
 
 
-def end_giveaway(giveaway_id: str, status: str = 'ended'):
+def end_giveaway(giveaway_id: str, status: str = 'ended') -> bool:
+    """
+    Atomically transition a giveaway from 'active' to *status*.
+    Returns True if the row was updated, False if already ended/cancelled/missing.
+    Only ever transitions from 'active' so two concurrent callers cannot both draw.
+    """
     with get_connection() as conn:
         _ensure_giveaways_table(conn)
-        conn.execute(
-            "UPDATE giveaways SET status=? WHERE giveaway_id=?",
+        cur = conn.execute(
+            "UPDATE giveaways SET status=? WHERE giveaway_id=? AND status='active'",
             (status, giveaway_id)
         )
         conn.commit()
+    return cur.rowcount > 0
 
 
 def cancel_giveaway(message_id: int) -> bool:
