@@ -43,7 +43,7 @@ from utils.database import (
     get_guild_config, set_guild_config,
     log_staff_action,
 )
-from utils.permissions import is_authorized, CONFIG as BOT_CONFIG
+from utils.permissions import is_authorized
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +81,16 @@ def _admin_role_id(guild_id: int) -> Optional[int]:
             return int(raw)
         except ValueError:
             pass
-    # Fall back to global OWNER_ID
+    return None
+
+def _mediation_role_id(guild_id: int) -> Optional[int]:
+    """Return the mediation staff role ID from the DB, or None if not configured."""
+    raw = _lcfg(guild_id, "mediation_staff_role_id")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
     return None
 
 def _is_listing_admin(member: discord.Member, guild_id: int) -> bool:
@@ -3118,10 +3127,12 @@ class ListingsCog(commands.Cog, name="Listings"):
         row   = get_listing(listing_id)
 
         # Create appeal channel
-        appeal_cat_id = _lcfg(guild.id, "appeal_category_id")
-        appeal_cat    = guild.get_channel(int(appeal_cat_id)) if appeal_cat_id else None
-        admin_role_id = _admin_role_id(guild.id)
-        admin_role    = guild.get_role(admin_role_id) if admin_role_id else None
+        appeal_cat_id    = _lcfg(guild.id, "appeal_category_id")
+        appeal_cat       = guild.get_channel(int(appeal_cat_id)) if appeal_cat_id else None
+        admin_role_id    = _admin_role_id(guild.id)
+        admin_role       = guild.get_role(admin_role_id) if admin_role_id else None
+        med_role_id      = _mediation_role_id(guild.id)
+        mediation_role   = guild.get_role(med_role_id) if med_role_id else None
 
         accused_m = guild.get_member(accused_id)
         ch_name   = f"appeal-{listing_id.lower()}-{accused_m.name[:12].lower() if accused_m else accused_id}"
@@ -3134,6 +3145,8 @@ class ListingsCog(commands.Cog, name="Listings"):
             overwrites[accused_m] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
         if admin_role:
             overwrites[admin_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+        if mediation_role:
+            overwrites[mediation_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
         try:
             appeal_ch = await guild.create_text_channel(
@@ -3648,6 +3661,16 @@ class ListingsCog(commands.Cog, name="Listings"):
             return
         _set_lcfg(interaction.guild_id, "admin_role_id", str(role.id))
         await interaction.followup.send(f"✅ Admin role set to {role.mention}.", ephemeral=True)
+
+    @ladmin.command(name="setmediationrole", description="Set the mediation staff role for listing appeals")
+    @app_commands.describe(role="The mediation staff role (given access to all appeal channels)")
+    async def la_setmediationrole(self, interaction: discord.Interaction, role: discord.Role):
+        await interaction.response.defer(ephemeral=True)
+        if not is_authorized(interaction.user, interaction.guild, "listingadmin"):
+            await interaction.followup.send("Only the bot owner can set the mediation role.", ephemeral=True)
+            return
+        _set_lcfg(interaction.guild_id, "mediation_staff_role_id", str(role.id))
+        await interaction.followup.send(f"✅ Mediation staff role set to {role.mention}.", ephemeral=True)
 
     @ladmin.command(name="forceclose", description="Forcefully cancel an active listing")
     @app_commands.describe(listing_id="The listing ID to cancel (e.g. AUC-4821)")
