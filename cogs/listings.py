@@ -35,7 +35,7 @@ from utils.database import (
     create_listing, get_listing, update_listing, atomic_claim_listing,
     atomic_bump_claim,
     get_active_listings, get_user_listings, get_listing_history,
-    get_expired_active_listings,
+    get_expired_active_listings, wtb_duplicate_exists,
     set_user_ign, get_user_ign,
     create_listing_transaction, get_transaction_by_channel, update_transaction,
     add_listing_rating, get_user_avg_rating,
@@ -95,7 +95,12 @@ def _is_listing_admin(member: discord.Member, guild_id: int) -> bool:
 # ── ID generation ──────────────────────────────────────────────────────────────
 
 def _gen_listing_id(listing_type: str) -> str:
-    prefix = "AUC" if listing_type == "auction" else "BID"
+    if listing_type == "auction":
+        prefix = "AUC"
+    elif listing_type == "wtb":
+        prefix = "WTB"
+    else:
+        prefix = "BID"
     num = random.randint(1000, 9999)
     return f"{prefix}-{num}"
 
@@ -193,7 +198,7 @@ def _build_listing_embed(data: dict, guild: discord.Guild, is_preview: bool = Fa
     if is_preview:
         color = discord.Color.blurple()
 
-    title = f"📦 {item_name}"
+    title = f"🙋 WANTED: {item_name}" if ltype == "wtb" else f"📦 {item_name}"
     disclaimer = (
         "-# ⚠️ This server is not liable for scams or damages. "
         "We only facilitate listings — we cannot control others' intentions. "
@@ -205,9 +210,11 @@ def _build_listing_embed(data: dict, guild: discord.Guild, is_preview: bool = Fa
     if not is_preview:
         avg, cnt = get_user_avg_rating(seller_id) if seller_id else (0.0, 0)
         rating_str = _stars(avg, cnt)
-        embed.add_field(name="Seller", value=f"{seller_mention}\n{rating_str}", inline=True)
+        owner_label = "Requested by" if ltype == "wtb" else "Seller"
+        embed.add_field(name=owner_label, value=f"{seller_mention}\n{rating_str}", inline=True)
     else:
-        embed.add_field(name="Listed by", value=seller_mention, inline=True)
+        owner_label = "Requested by" if ltype == "wtb" else "Listed by"
+        embed.add_field(name=owner_label, value=seller_mention, inline=True)
 
     embed.add_field(name="Category", value=category, inline=True)
     embed.add_field(name="Quantity", value=qty, inline=True)
@@ -218,6 +225,21 @@ def _build_listing_embed(data: dict, guild: discord.Guild, is_preview: bool = Fa
     if ltype == "auction":
         buy_now = _fmt_price(data.get("buy_now_price"))
         embed.add_field(name="🏷️ AUCTION", value=f"**Buy Now:** ${buy_now}", inline=False)
+    elif ltype == "wtb":
+        budget  = _fmt_price(data.get("buy_now_price"))
+        ends_at = data.get("ends_at")
+        lines = [f"**Max Budget:** ${budget}"]
+        if ends_at:
+            try:
+                try:
+                    end_dt = datetime.strptime(ends_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    end_dt = datetime.fromisoformat(ends_at.replace("Z", "+00:00"))
+                ts = int(end_dt.timestamp())
+                lines.append(f"**Expires:** <t:{ts}:F> (<t:{ts}:R>)")
+            except Exception:
+                lines.append(f"**Expires:** {ends_at}")
+        embed.add_field(name="🙋 WANT TO BUY", value="\n".join(lines), inline=False)
     else:
         starting = _fmt_price(data.get("starting_bid"))
         current  = data.get("current_bid")
@@ -418,6 +440,109 @@ class BiddingModal(discord.ui.Modal, title="Create Bidding Listing"):
         await self._cog._show_preview(interaction, data)
 
 
+class WTBModal(discord.ui.Modal, title="Create Want-To-Buy Request"):
+    item_name = discord.ui.TextInput(
+        label="Item Name",
+        placeholder="e.g. Blaze Spawner",
+        max_length=100,
+    )
+    description = discord.ui.TextInput(
+        label="Description (optional)",
+        style=discord.TextStyle.paragraph,
+        placeholder="Any extra info about what you're looking for…",
+        required=False,
+        max_length=500,
+    )
+    quantity = discord.ui.TextInput(
+        label="Quantity",
+        placeholder="e.g. 1",
+        max_length=20,
+    )
+    max_budget = discord.ui.TextInput(
+        label="Max Budget ($)",
+        placeholder="e.g. 5000, 100k, 2.5m, 5b",
+        max_length=30,
+    )
+
+    def __init__(self, cog, category: str, duration_label: str, duration_ms: int, prefill: dict = None):
+        super().__init__()
+        self._cog           = cog
+        self._category      = category
+        self._duration_label = duration_label
+        self._duration_ms   = duration_ms
+        if prefill:
+            self.item_name.default   = prefill.get("item_name", "")
+            self.description.default = prefill.get("description", "")
+            self.quantity.default    = prefill.get("quantity", "")
+            self.max_budget.default  = prefill.get("max_budget", "")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw_budget = self.max_budget.value.strip()
+        try:
+            norm_budget = _normalise_price(raw_budget)
+        except (ValueError, ZeroDivisionError, OverflowError):
+            await interaction.response.send_message(
+                "❌ Invalid max budget. Enter a positive number like `5000`, `100k`, `2.5m`, or `5b`.",
+                ephemeral=True,
+            )
+            return
+        data = {
+            "type":           "wtb",
+            "category":       self._category,
+            "item_name":      self.item_name.value.strip(),
+            "description":    self.description.value.strip(),
+            "quantity":       self.quantity.value.strip(),
+            "buy_now_price":  norm_budget,
+            "starting_bid":   None,
+            "min_increment":  None,
+            "reserve_price":  None,
+            "duration_label": self._duration_label,
+            "duration_ms":    self._duration_ms,
+        }
+        await self._cog._show_preview(interaction, data)
+
+
+class WTBFulfilModal(discord.ui.Modal, title="Offer to Sell"):
+    price = discord.ui.TextInput(
+        label="Your Price ($)",
+        placeholder="e.g. 4500, 100k, 2m",
+        max_length=30,
+    )
+    message = discord.ui.TextInput(
+        label="Message to Requester (optional)",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=300,
+    )
+
+    def __init__(self, cog, listing_id: str):
+        super().__init__()
+        self._cog        = cog
+        self._listing_id = listing_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self._cog._handle_wtb_fulfil_submit(interaction, self._listing_id,
+                                                    self.price.value.strip(),
+                                                    self.message.value.strip())
+
+
+class WTBCounterModal(discord.ui.Modal, title="Counter Offer"):
+    counter_amount = discord.ui.TextInput(
+        label="Your Counter Offer ($)",
+        placeholder="e.g. 4800, 100k, 2m",
+        max_length=30,
+    )
+
+    def __init__(self, cog, token: str):
+        super().__init__()
+        self._cog   = cog
+        self._token = token
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self._cog._handle_wtb_counter_submit(interaction, self._token,
+                                                     self.counter_amount.value.strip())
+
+
 class OfferModal(discord.ui.Modal, title="Make an Offer"):
     offer_amount = discord.ui.TextInput(
         label="Offer Amount ($)",
@@ -582,6 +707,10 @@ class ListingsCog(commands.Cog, name="Listings"):
         self._offers:  dict[str, dict] = {}
         # Counter offers: token → {listing_id, seller_id, buyer_id, counter}
         self._counters: dict[str, dict] = {}
+        # WTB "I can sell this" offers: token → {listing_id, fulfiller_id, guild_id, price}
+        self._wtb_offers: dict[str, dict] = {}
+        # WTB counter offers: token → {listing_id, requester_id, fulfiller_id, guild_id, counter}
+        self._wtb_counters: dict[str, dict] = {}
         self._expiry_task: Optional[asyncio.Task] = None
 
     async def cog_load(self):
@@ -619,6 +748,22 @@ class ListingsCog(commands.Cog, name="Listings"):
                         cutoff_ids.append(token)
                 for token in cutoff_ids:
                     self._counters.pop(token, None)
+
+                cutoff_ids = []
+                for token, entry in list(self._wtb_offers.items()):
+                    row = get_listing(entry.get("listing_id", ""))
+                    if not row or row["status"] != "active":
+                        cutoff_ids.append(token)
+                for token in cutoff_ids:
+                    self._wtb_offers.pop(token, None)
+
+                cutoff_ids = []
+                for token, entry in list(self._wtb_counters.items()):
+                    row = get_listing(entry.get("listing_id", ""))
+                    if not row or row["status"] != "active":
+                        cutoff_ids.append(token)
+                for token in cutoff_ids:
+                    self._wtb_counters.pop(token, None)
             except Exception as exc:
                 logger.warning("Offer cleanup error: %s", exc)
 
@@ -659,18 +804,27 @@ class ListingsCog(commands.Cog, name="Listings"):
 
         log_ch_id = _lcfg(guild_id, "log_channel_id")
 
+        is_wtb = row["type"] == "wtb"
+
         if not current_bidder:
-            # No bids
+            # No bids (or, for WTB, no one offered to fulfil the request)
             update_listing(listing_id, status="expired")
             await self._update_live_embed(guild, row, status="expired")
             seller = guild.get_member(seller_id) or self.bot.get_user(seller_id)
             if seller:
                 try:
-                    await seller.send(embed=discord.Embed(
-                        title="⏰ Listing Expired — No Bids",
-                        description=f"Your listing **{row['item_name']}** (`{listing_id}`) expired with no bids.",
-                        color=discord.Color.greyple(),
-                    ))
+                    if is_wtb:
+                        await seller.send(embed=discord.Embed(
+                            title="⏰ Request Expired — No Offers",
+                            description=f"Your WTB request for **{row['item_name']}** (`{listing_id}`) expired with no offers.",
+                            color=discord.Color.greyple(),
+                        ))
+                    else:
+                        await seller.send(embed=discord.Embed(
+                            title="⏰ Listing Expired — No Bids",
+                            description=f"Your listing **{row['item_name']}** (`{listing_id}`) expired with no bids.",
+                            color=discord.Color.greyple(),
+                        ))
                 except discord.Forbidden:
                     pass
             for uid in watchers:
@@ -678,15 +832,15 @@ class ListingsCog(commands.Cog, name="Listings"):
                 if m:
                     try:
                         await m.send(embed=discord.Embed(
-                            title=f"⏰ Listing Expired — {row['item_name']}",
-                            description=f"`{listing_id}` expired with no bids.",
+                            title=f"⏰ {'Request' if is_wtb else 'Listing'} Expired — {row['item_name']}",
+                            description=f"`{listing_id}` expired with no {'offers' if is_wtb else 'bids'}.",
                             color=discord.Color.greyple(),
                         ))
                     except discord.Forbidden:
                         pass
             await self._post_log(guild, log_ch_id, "Listing Expired", discord.Color.greyple(), [
                 ("Item", row["item_name"], True), ("Seller", f"<@{seller_id}>", True),
-                ("Listing ID", listing_id, True), ("Outcome", "No bids", True),
+                ("Listing ID", listing_id, True), ("Outcome", "No offers" if is_wtb else "No bids", True),
                 ("Timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), False),
             ])
         else:
@@ -847,6 +1001,28 @@ class ListingsCog(commands.Cog, name="Listings"):
             listing_id = cid[len("listing_buy_"):]
             await self._handle_buy(interaction, listing_id)
 
+        # WTB — seller offer responses (requester's DM) — specific BEFORE generic
+        elif cid.startswith("listing_wtbresp_accept_"):
+            token = cid[len("listing_wtbresp_accept_"):]
+            await self._handle_wtb_resp_accept(interaction, token)
+        elif cid.startswith("listing_wtbresp_decline_"):
+            token = cid[len("listing_wtbresp_decline_"):]
+            await self._handle_wtb_resp_decline(interaction, token)
+        elif cid.startswith("listing_wtbresp_counter_"):
+            token = cid[len("listing_wtbresp_counter_"):]
+            await self._handle_wtb_resp_counter(interaction, token)
+        # WTB — counter offer responses (fulfiller's DM)
+        elif cid.startswith("listing_wtbctr_accept_"):
+            token = cid[len("listing_wtbctr_accept_"):]
+            await self._handle_wtb_ctr_accept(interaction, token)
+        elif cid.startswith("listing_wtbctr_decline_"):
+            token = cid[len("listing_wtbctr_decline_"):]
+            await self._handle_wtb_ctr_decline(interaction, token)
+        # WTB — "I Can Sell This" button on the live request
+        elif cid.startswith("listing_wtbfulfil_"):
+            listing_id = cid[len("listing_wtbfulfil_"):]
+            await self._handle_wtb_fulfil(interaction, listing_id)
+
         # Offer responses — specific BEFORE generic listing_offer_
         elif cid.startswith("listing_offer_accept_"):
             token = cid[len("listing_offer_accept_"):]
@@ -973,11 +1149,17 @@ class ListingsCog(commands.Cog, name="Listings"):
             style=discord.ButtonStyle.secondary,
             custom_id=f"listing_type_bidding_{temp_id}",
         ))
+        view.add_item(discord.ui.Button(
+            label="Want to Buy — Request an item",
+            emoji="🙋",
+            style=discord.ButtonStyle.success,
+            custom_id=f"listing_type_wtb_{temp_id}",
+        ))
 
         await interaction.response.send_message(
             embed=discord.Embed(
                 title="📋 What type of listing?",
-                description="Choose how you want to sell your item.",
+                description="Choose how you want to sell — or request — your item.",
                 color=discord.Color.blurple(),
             ),
             view=view,
@@ -1072,6 +1254,15 @@ class ListingsCog(commands.Cog, name="Listings"):
                     except Exception:
                         extra = ""
                     lines.append(f"🔨 **{name}** `{lid}` — bid: {cb}{extra}")
+                elif ltype == "wtb":
+                    ea = r["ends_at"]
+                    try:
+                        et = datetime.strptime(ea, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                        ts = int(et.timestamp())
+                        extra = f" • expires <t:{ts}:R>"
+                    except Exception:
+                        extra = ""
+                    lines.append(f"🙋 **{name}** `{lid}` — budget: ${r['buy_now_price']}{extra}")
                 else:
                     lines.append(f"🏷️ **{name}** `{lid}` — ${r['buy_now_price']}")
                 if btn_count < 5:
@@ -1179,9 +1370,15 @@ class ListingsCog(commands.Cog, name="Listings"):
 
         category = self._pending[temp_id].get("category", "Items")
         prefill  = self._pending[temp_id].get("prefill")
-        await interaction.response.send_modal(
-            BiddingModal(self, category, dur_label, dur_ms, prefill=prefill)
-        )
+        ltype    = self._pending[temp_id].get("type", "bidding")
+        if ltype == "wtb":
+            await interaction.response.send_modal(
+                WTBModal(self, category, dur_label, dur_ms, prefill=prefill)
+            )
+        else:
+            await interaction.response.send_modal(
+                BiddingModal(self, category, dur_label, dur_ms, prefill=prefill)
+            )
 
     # ── Preview ────────────────────────────────────────────────────────────────
 
@@ -1201,7 +1398,7 @@ class ListingsCog(commands.Cog, name="Listings"):
         embed = _build_listing_embed(data, interaction.guild, is_preview=True)
         embed.set_author(name="⚠️ LISTING PREVIEW — Only you can see this")
 
-        if data["type"] == "bidding":
+        if data["type"] in ("bidding", "wtb"):
             dur_label = data.get("duration_label", "?")
             embed.add_field(name="⏱️ Duration", value=dur_label, inline=True)
 
@@ -1257,12 +1454,26 @@ class ListingsCog(commands.Cog, name="Listings"):
             )
             return
 
-        if data["type"] == "bidding":
+        if data["type"] in ("bidding", "wtb"):
             dur_ms  = data.get("duration_ms", 3600_000)
             ends_at = (datetime.now(timezone.utc) + timedelta(milliseconds=dur_ms)).strftime("%Y-%m-%d %H:%M:%S")
 
+        # ── Dedupe: prevent duplicate WTB requests for the same item ──────────
+        # This is a fast, friendly pre-check only — it is not atomic. The real
+        # guarantee comes from the idx_wtb_active_dedupe unique index enforced
+        # by create_listing() below, which is checked regardless of races here.
+        if data["type"] == "wtb" and wtb_duplicate_exists(interaction.user.id, guild_id, data["item_name"]):
+            await interaction.response.edit_message(
+                content=(
+                    f"❌ You already have an active WTB request for **{data['item_name']}**. "
+                    "Cancel it first if you want to change the details."
+                ),
+                embed=None, view=None,
+            )
+            return
+
         # Save to DB
-        create_listing(
+        inserted = create_listing(
             listing_id  = listing_id,
             guild_id    = guild_id,
             seller_id   = interaction.user.id,
@@ -1278,6 +1489,17 @@ class ListingsCog(commands.Cog, name="Listings"):
             duration_ms   = data.get("duration_ms"),
             ends_at       = ends_at,
         )
+        if not inserted:
+            # Only WTB requests can hit the unique dedupe index — a concurrent
+            # confirm beat this one to it.
+            await interaction.response.edit_message(
+                content=(
+                    f"❌ You already have an active WTB request for **{data['item_name']}**. "
+                    "Cancel it first if you want to change the details."
+                ),
+                embed=None, view=None,
+            )
+            return
 
         # Post to listings channel
         listing_ch_id = _lcfg(guild_id, "channel_id")
@@ -1344,6 +1566,19 @@ class ListingsCog(commands.Cog, name="Listings"):
             }
             entry["prefill"] = prefill
             await interaction.response.send_modal(AuctionModal(self, category, prefill=prefill))
+        elif ltype == "wtb":
+            prefill = {
+                "item_name":   data.get("item_name", ""),
+                "description": data.get("description", ""),
+                "quantity":    data.get("quantity", ""),
+                "max_budget":  data.get("buy_now_price", ""),
+            }
+            entry["prefill"] = prefill
+            dur_label = data.get("duration_label", "1 hour")
+            dur_ms    = data.get("duration_ms", DURATIONS["1 hour"])
+            await interaction.response.send_modal(
+                WTBModal(self, category, dur_label, dur_ms, prefill=prefill)
+            )
         else:
             prefill = {
                 "item_name":   data.get("item_name", ""),
@@ -1382,6 +1617,11 @@ class ListingsCog(commands.Cog, name="Listings"):
             view.add_item(discord.ui.Button(
                 label="💬 Make Offer", style=discord.ButtonStyle.primary,
                 custom_id=f"listing_offer_{listing_id}",
+            ))
+        elif ltype == "wtb":
+            view.add_item(discord.ui.Button(
+                label="🤝 I Can Sell This", style=discord.ButtonStyle.success,
+                custom_id=f"listing_wtbfulfil_{listing_id}",
             ))
         else:
             view.add_item(discord.ui.Button(
@@ -1797,6 +2037,309 @@ class ListingsCog(commands.Cog, name="Listings"):
 
     async def _handle_counter_decline(self, interaction: discord.Interaction, token: str):
         self._counters.pop(token, None)
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="❌ Counter Declined", color=discord.Color.red()),
+            view=None,
+        )
+
+    # ── WTB: "I Can Sell This" fulfil flow ────────────────────────────────────
+
+    async def _handle_wtb_fulfil(self, interaction: discord.Interaction, listing_id: str):
+        row = get_listing(listing_id)
+        if not row or row["status"] != "active" or row["type"] != "wtb":
+            await interaction.response.send_message("This request is no longer active.", ephemeral=True)
+            return
+        if row["seller_id"] == interaction.user.id:
+            await interaction.response.send_message("You cannot fulfil your own request.", ephemeral=True)
+            return
+        if not get_user_ign(interaction.user.id):
+            await interaction.response.send_message(
+                "⚠️ You need to set your Minecraft IGN before offering to sell.\n"
+                "Use the **🎮 Set IGN** button on the marketplace panel.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(WTBFulfilModal(self, listing_id))
+
+    async def _handle_wtb_fulfil_submit(self, interaction: discord.Interaction,
+                                         listing_id: str, price_str: str, msg: str):
+        row = get_listing(listing_id)
+        if not row or row["status"] != "active":
+            await interaction.response.send_message("Request no longer available.", ephemeral=True)
+            return
+        if not get_user_ign(interaction.user.id):
+            await interaction.response.send_message(
+                "⚠️ Set your IGN first using the **🎮 Set IGN** button on the marketplace panel.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            price = _normalise_price(price_str)
+        except (ValueError, ZeroDivisionError, OverflowError):
+            await interaction.response.send_message(
+                "❌ Invalid price. Enter a positive number like `5000`, `100k`, `2m`, etc.",
+                ephemeral=True,
+            )
+            return
+
+        token = self._make_temp_id(interaction.user.id)
+
+        requester_id = row["seller_id"]
+        guild        = interaction.guild
+        requester    = guild.get_member(requester_id) or self.bot.get_user(requester_id)
+        if not requester:
+            await interaction.response.send_message("Could not contact the requester.", ephemeral=True)
+            return
+
+        view = discord.ui.View(timeout=86400)
+        view.add_item(discord.ui.Button(label="✅ Accept", style=discord.ButtonStyle.success,
+                                         custom_id=f"listing_wtbresp_accept_{token}"))
+        view.add_item(discord.ui.Button(label="❌ Decline", style=discord.ButtonStyle.danger,
+                                         custom_id=f"listing_wtbresp_decline_{token}"))
+        view.add_item(discord.ui.Button(label="↩️ Counter Offer", style=discord.ButtonStyle.primary,
+                                         custom_id=f"listing_wtbresp_counter_{token}"))
+
+        offer_embed = discord.Embed(
+            title=f"🤝 Someone can sell you {row['item_name']}!",
+            color=discord.Color.blurple(),
+        )
+        offer_embed.add_field(name="Seller", value=interaction.user.mention, inline=True)
+        offer_embed.add_field(name="Price",  value=f"${_fmt_price(price)}", inline=True)
+        offer_embed.add_field(name="Listing", value=listing_id, inline=True)
+        if msg:
+            offer_embed.add_field(name="Message", value=msg, inline=False)
+
+        try:
+            await requester.send(embed=offer_embed, view=view)
+        except discord.Forbidden:
+            await interaction.response.send_message("Could not DM the requester — they may have DMs disabled.", ephemeral=True)
+            return
+
+        # Only persist the pending offer once the DM has actually gone out,
+        # so a failed DM never leaves a stale, un-actionable token behind.
+        self._wtb_offers[token] = {
+            "listing_id":   listing_id,
+            "fulfiller_id": interaction.user.id,
+            "guild_id":     interaction.guild_id,
+            "price":        price,
+        }
+
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="🤝 Offer Sent",
+                description=f"Your offer of **${_fmt_price(price)}** has been sent to the requester.",
+                color=discord.Color.green(),
+            ),
+            ephemeral=True,
+        )
+
+    async def _handle_wtb_resp_accept(self, interaction: discord.Interaction, token: str):
+        entry = self._wtb_offers.pop(token, None)
+        if not entry:
+            await interaction.response.edit_message(content="This offer has expired.", view=None)
+            return
+
+        row = get_listing(entry["listing_id"])
+        if not row:
+            await interaction.response.edit_message(content="Request not found.", view=None)
+            return
+        if interaction.user.id != row["seller_id"]:
+            await interaction.response.send_message("Only the requester can accept this.", ephemeral=True)
+            return
+
+        guild = self.bot.get_guild(entry["guild_id"])
+        if not guild:
+            await interaction.response.edit_message(content="Guild not found.", view=None)
+            return
+        if row["status"] != "active":
+            await interaction.response.edit_message(content="Request no longer available.", view=None)
+            return
+
+        # Atomic claim — prevents two fulfillers both being accepted
+        claimed = atomic_claim_listing(entry["listing_id"], "sold")
+        if not claimed:
+            await interaction.response.edit_message(content="This request was just fulfilled by someone else.", view=None)
+            return
+        await self._update_live_embed(guild, row, status="sold")
+
+        ticket_ch = await self._create_transaction_ticket(
+            guild, entry["listing_id"], buyer_id=row["seller_id"], seller_id=entry["fulfiller_id"],
+            final_price=str(entry["price"]), listing_data=dict(row),
+        )
+
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="✅ Offer Accepted",
+                description=f"Transaction channel created: {ticket_ch.mention if ticket_ch else 'N/A'}",
+                color=discord.Color.green(),
+            ),
+            view=None,
+        )
+        fulfiller = guild.get_member(entry["fulfiller_id"]) or self.bot.get_user(entry["fulfiller_id"])
+        if fulfiller:
+            try:
+                await fulfiller.send(embed=discord.Embed(
+                    title="✅ Offer Accepted!",
+                    description=f"Your offer to sell **{row['item_name']}** was accepted. Ticket: {ticket_ch.mention if ticket_ch else 'created'}",
+                    color=discord.Color.green(),
+                ))
+            except discord.Forbidden:
+                pass
+
+    async def _handle_wtb_resp_decline(self, interaction: discord.Interaction, token: str):
+        entry = self._wtb_offers.pop(token, None)
+        if not entry:
+            await interaction.response.edit_message(content="This offer has expired.", view=None)
+            return
+        guild = self.bot.get_guild(entry["guild_id"])
+        fulfiller = (guild.get_member(entry["fulfiller_id"]) if guild else None) or self.bot.get_user(entry["fulfiller_id"])
+        if fulfiller:
+            try:
+                row = get_listing(entry["listing_id"])
+                await fulfiller.send(embed=discord.Embed(
+                    title="❌ Offer Declined",
+                    description=f"Your offer to sell **{row['item_name'] if row else entry['listing_id']}** was declined.",
+                    color=discord.Color.red(),
+                ))
+            except discord.Forbidden:
+                pass
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="❌ Offer Declined", color=discord.Color.red()),
+            view=None,
+        )
+
+    async def _handle_wtb_resp_counter(self, interaction: discord.Interaction, token: str):
+        entry = self._wtb_offers.get(token)
+        if not entry:
+            await interaction.response.edit_message(content="This offer has expired.", view=None)
+            return
+        row = get_listing(entry["listing_id"])
+        if not row or row["status"] != "active":
+            self._wtb_offers.pop(token, None)
+            await interaction.response.edit_message(content="This request is no longer available.", view=None)
+            return
+        await interaction.response.send_modal(WTBCounterModal(self, token))
+
+    async def _handle_wtb_counter_submit(self, interaction: discord.Interaction,
+                                          token: str, counter_str: str):
+        entry = self._wtb_offers.get(token)
+        if not entry:
+            await interaction.response.send_message("This offer has expired.", ephemeral=True)
+            return
+        try:
+            counter = _normalise_price(counter_str)
+        except (ValueError, ZeroDivisionError, OverflowError):
+            await interaction.response.send_message(
+                "❌ Invalid counter offer amount. Enter a positive number like `5000`, `100k`, `2m`, etc.",
+                ephemeral=True,
+            )
+            return
+
+        row   = get_listing(entry["listing_id"])
+        if not row or row["status"] != "active":
+            self._wtb_offers.pop(token, None)
+            await interaction.response.send_message("This request is no longer available.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        fulfiller = (guild.get_member(entry["fulfiller_id"]) if guild else None) or self.bot.get_user(entry["fulfiller_id"])
+        if not fulfiller:
+            await interaction.response.send_message("Could not contact the seller.", ephemeral=True)
+            return
+
+        ctoken = self._make_temp_id(interaction.user.id)
+        view = discord.ui.View(timeout=86400)
+        view.add_item(discord.ui.Button(label="✅ Accept Counter", style=discord.ButtonStyle.success,
+                                         custom_id=f"listing_wtbctr_accept_{ctoken}"))
+        view.add_item(discord.ui.Button(label="❌ Decline", style=discord.ButtonStyle.danger,
+                                         custom_id=f"listing_wtbctr_decline_{ctoken}"))
+
+        try:
+            await fulfiller.send(embed=discord.Embed(
+                title=f"↩️ Counter Offer — {row['item_name'] if row else entry['listing_id']}",
+                description=f"The requester countered with **${_fmt_price(counter)}**. Do you accept?",
+                color=discord.Color.orange(),
+            ), view=view)
+        except discord.Forbidden:
+            await interaction.response.send_message("Could not DM the seller.", ephemeral=True)
+            return
+
+        # Only persist the counter once the DM has actually gone out.
+        self._wtb_counters[ctoken] = {
+            "listing_id":   entry["listing_id"],
+            "requester_id": interaction.user.id,
+            "fulfiller_id": entry["fulfiller_id"],
+            "guild_id":     interaction.guild_id,
+            "counter":      counter,
+        }
+
+        self._wtb_offers.pop(token, None)
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="↩️ Counter Sent", color=discord.Color.orange()),
+            view=None,
+        )
+
+    async def _handle_wtb_ctr_accept(self, interaction: discord.Interaction, token: str):
+        entry = self._wtb_counters.pop(token, None)
+        if not entry:
+            await interaction.response.edit_message(content="Counter expired.", view=None)
+            return
+        if interaction.user.id != entry["fulfiller_id"]:
+            await interaction.response.send_message("Only the seller can accept this.", ephemeral=True)
+            return
+
+        row   = get_listing(entry["listing_id"])
+        guild = self.bot.get_guild(entry["guild_id"])
+        if not row or row["status"] != "active" or not guild:
+            await interaction.response.edit_message(content="Request no longer available.", view=None)
+            return
+
+        claimed = atomic_claim_listing(entry["listing_id"], "sold")
+        if not claimed:
+            await interaction.response.edit_message(content="This request was just fulfilled by someone else.", view=None)
+            return
+        await self._update_live_embed(guild, row, status="sold")
+
+        ticket_ch = await self._create_transaction_ticket(
+            guild, entry["listing_id"], buyer_id=entry["requester_id"], seller_id=entry["fulfiller_id"],
+            final_price=str(entry["counter"]), listing_data=dict(row),
+        )
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="✅ Counter Accepted!",
+                description=f"Ticket: {ticket_ch.mention if ticket_ch else 'created'}",
+                color=discord.Color.green(),
+            ),
+            view=None,
+        )
+        requester = guild.get_member(entry["requester_id"]) or self.bot.get_user(entry["requester_id"])
+        if requester:
+            try:
+                await requester.send(embed=discord.Embed(
+                    title="✅ Counter Accepted!",
+                    description=f"Your counter offer on **{row['item_name']}** was accepted. Ticket: {ticket_ch.mention if ticket_ch else 'created'}",
+                    color=discord.Color.green(),
+                ))
+            except discord.Forbidden:
+                pass
+
+    async def _handle_wtb_ctr_decline(self, interaction: discord.Interaction, token: str):
+        entry = self._wtb_counters.pop(token, None)
+        if not entry:
+            await interaction.response.edit_message(content="Counter expired.", view=None)
+            return
+        guild = self.bot.get_guild(entry["guild_id"])
+        requester = (guild.get_member(entry["requester_id"]) if guild else None) or self.bot.get_user(entry["requester_id"])
+        if requester:
+            try:
+                await requester.send(embed=discord.Embed(
+                    title="❌ Counter Declined",
+                    description="The seller declined your counter offer.",
+                    color=discord.Color.red(),
+                ))
+            except discord.Forbidden:
+                pass
         await interaction.response.edit_message(
             embed=discord.Embed(title="❌ Counter Declined", color=discord.Color.red()),
             view=None,

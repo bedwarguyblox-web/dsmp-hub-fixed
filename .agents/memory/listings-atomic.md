@@ -1,16 +1,10 @@
 ---
 name: Listings atomic state transitions
-description: How to prevent double-sell race conditions when closing a listing
+description: Race-safety pattern for the Discord bot's listings/marketplace system (buy/offer/counter/WTB flows).
 ---
 
-Multiple Discord interaction handlers (buy-now confirm, offer accept, counter accept) can fire concurrently for the same listing. A read-then-write pattern allows two buyers to both see `status='active'` and both create transaction tickets.
-
-**Fix:** `atomic_claim_listing(listing_id, new_status)` in `utils/database.py` issues:
-```sql
-UPDATE listings SET status=? WHERE listing_id=? AND status='active'
-```
-and returns `True` only if `rowcount > 0`. Callers reject the interaction immediately on `False`.
-
-**Why:** SQLite serializes writes per connection, so this conditional update is effectively atomic for our single-file DB.
-
-**How to apply:** Any code path that transitions a listing out of `active` must use `atomic_claim_listing` instead of `update_listing(... status=...)`. Currently covers: `_handle_buynow_confirm`, `_handle_offer_accept`, `_handle_counter_accept`. The bid-expiry loop uses a direct `update_listing` call but runs on a single asyncio task so no concurrent risk there.
+- `atomic_claim_listing(listing_id, new_status)` does an atomic `active → new_status` UPDATE (checked via rowcount) to prevent double-sell races; always use it, not a read-then-write check, before creating a transaction ticket.
+- **Why:** two users can accept/buy/fulfil concurrently; only a single atomic UPDATE call correctly picks one winner.
+- **How to apply:** any new "accept" path (e.g. WTB seller-offer accept, counter-offer accept) must call `atomic_claim_listing` before `_create_transaction_ticket`, and treat a `False` return as "someone else already claimed this."
+- For DB-level dedupe (e.g. "one active WTB request per user+item"), a pre-check query is not race-safe by itself — back it with a partial UNIQUE index (SQLite supports `CREATE UNIQUE INDEX ... WHERE <condition>`) and have the insert function catch `IntegrityError` and return `False`/`True` so the caller can react atomically.
+- When persisting a pending-offer/counter token that leads to a DM, insert it into the in-memory dict only *after* the DM send succeeds — otherwise a `discord.Forbidden` leaves an orphaned, non-actionable token that lingers until the periodic cleanup loop reaps it.

@@ -1112,6 +1112,15 @@ def _ensure_listings_tables(conn):
     existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(listings)").fetchall()}
     if "bumped_at" not in existing_cols:
         conn.execute("ALTER TABLE listings ADD COLUMN bumped_at TEXT")
+    # Partial unique index: at most one active WTB request per (seller, guild, item name).
+    # Enforces the dedupe rule atomically at the DB layer so two concurrent
+    # confirms for the same request can't both insert (the pre-check in
+    # wtb_duplicate_exists is a fast, non-atomic friendly warning only).
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_wtb_active_dedupe
+        ON listings (seller_id, guild_id, LOWER(item_name))
+        WHERE type = 'wtb' AND status = 'active'
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS listing_users (
             discord_id  INTEGER PRIMARY KEY,
@@ -1152,19 +1161,28 @@ def create_listing(listing_id: str, guild_id: int, seller_id: int, item_name: st
                    description: str, quantity: str, category: str, listing_type: str,
                    buy_now_price: str = None, starting_bid: str = None,
                    min_increment: str = None, reserve_price: str = None,
-                   duration_ms: int = None, ends_at: str = None):
+                   duration_ms: int = None, ends_at: str = None) -> bool:
+    """Insert a new listing. Returns True on success, False if it was rejected
+    by the active-WTB-dedupe unique index (idx_wtb_active_dedupe) — i.e. the
+    same seller already has an active WTB request for this item name. Other
+    listing types never hit this constraint so they always return True."""
     with get_connection() as conn:
         _ensure_listings_tables(conn)
-        conn.execute("""
-            INSERT INTO listings
-                (listing_id, guild_id, seller_id, item_name, description, quantity,
-                 category, type, buy_now_price, starting_bid, min_increment,
-                 reserve_price, duration_ms, ends_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (listing_id, guild_id, seller_id, item_name, description, quantity,
-              category, listing_type, buy_now_price, starting_bid, min_increment,
-              reserve_price, duration_ms, ends_at))
-        conn.commit()
+        try:
+            conn.execute("""
+                INSERT INTO listings
+                    (listing_id, guild_id, seller_id, item_name, description, quantity,
+                     category, type, buy_now_price, starting_bid, min_increment,
+                     reserve_price, duration_ms, ends_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (listing_id, guild_id, seller_id, item_name, description, quantity,
+                  category, listing_type, buy_now_price, starting_bid, min_increment,
+                  reserve_price, duration_ms, ends_at))
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            return False
 
 
 def get_listing(listing_id: str):
@@ -1274,14 +1292,29 @@ def get_listing_history(guild_id: int, user_id: int = None, limit: int = 20, off
 
 
 def get_expired_active_listings():
-    """Return bidding listings whose ends_at has passed and are still active."""
+    """Return bidding/WTB listings whose ends_at has passed and are still active."""
     with get_connection() as conn:
         _ensure_listings_tables(conn)
         return conn.execute("""
             SELECT * FROM listings
-            WHERE status='active' AND type='bidding' AND ends_at IS NOT NULL
+            WHERE status='active' AND type IN ('bidding', 'wtb') AND ends_at IS NOT NULL
               AND ends_at <= datetime('now')
         """).fetchall()
+
+
+def wtb_duplicate_exists(seller_id: int, guild_id: int, item_name: str) -> bool:
+    """Return True if this user already has an active WTB request for an item
+    with the same name (case-insensitive) in this guild. Prevents duplicate
+    WTB inserts from repeated modal submissions/relists of the same request."""
+    with get_connection() as conn:
+        _ensure_listings_tables(conn)
+        row = conn.execute("""
+            SELECT 1 FROM listings
+            WHERE seller_id=? AND guild_id=? AND type='wtb' AND status='active'
+              AND LOWER(item_name)=LOWER(?)
+            LIMIT 1
+        """, (seller_id, guild_id, item_name)).fetchone()
+    return row is not None
 
 
 def set_user_ign(discord_id: int, ign: str):
