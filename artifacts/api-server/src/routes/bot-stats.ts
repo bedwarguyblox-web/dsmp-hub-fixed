@@ -57,7 +57,7 @@ router.get("/stats", (req, res) => {
 });
 
 router.get("/vouches/leaderboard", (req, res) => {
-  const limit = Math.min(Number(req.query["limit"] ?? 10), 100);
+  const limit = Math.min(Math.max(1, Number(req.query["limit"]) || 10), 100);
   try {
     const db = getDb();
     if (!db) { res.json([]); return; }
@@ -72,7 +72,7 @@ router.get("/vouches/leaderboard", (req, res) => {
 });
 
 router.get("/scamvouches/leaderboard", (req, res) => {
-  const limit = Math.min(Number(req.query["limit"] ?? 10), 100);
+  const limit = Math.min(Math.max(1, Number(req.query["limit"]) || 10), 100);
   try {
     const db = getDb();
     if (!db) { res.json([]); return; }
@@ -87,7 +87,7 @@ router.get("/scamvouches/leaderboard", (req, res) => {
 });
 
 router.get("/strikes/recent", (req, res) => {
-  const limit = Math.min(Number(req.query["limit"] ?? 20), 100);
+  const limit = Math.min(Math.max(1, Number(req.query["limit"]) || 20), 100);
   try {
     const db = getDb();
     if (!db) { res.json([]); return; }
@@ -103,14 +103,15 @@ router.get("/strikes/recent", (req, res) => {
 });
 
 router.get("/builder/cases", (req, res) => {
+  const limit = Math.min(Math.max(1, Number(req.query["limit"]) || 200), 500);
   try {
     const db = getDb();
     if (!db) { res.json([]); return; }
     const rows = db.prepare(
       `SELECT case_id as caseId, builder_id as builderId, customer_id as customerId,
               ign, amount, status, start_time as startTime, end_time as endTime, created_at as createdAt
-       FROM builder_cases ORDER BY created_at DESC`
-    ).all() as { caseId: string; builderId: string; customerId: string; ign: string; amount: string; status: string; startTime: string | null; endTime: string | null; createdAt: string }[];
+       FROM builder_cases ORDER BY created_at DESC LIMIT ?`
+    ).all(limit) as { caseId: string; builderId: string; customerId: string; ign: string; amount: string; status: string; startTime: string | null; endTime: string | null; createdAt: string }[];
     res.json(GetBuilderCasesResponse.parse(rows.map((r) => ({ ...r, builderId: String(r.builderId), customerId: String(r.customerId) }))));
   } catch (err) {
     req.log.warn({ err }, "builder cases query failed");
@@ -119,7 +120,7 @@ router.get("/builder/cases", (req, res) => {
 });
 
 router.get("/builder/payments", (req, res) => {
-  const limit = Math.min(Number(req.query["limit"] ?? 20), 100);
+  const limit = Math.min(Math.max(1, Number(req.query["limit"]) || 20), 100);
   try {
     const db = getDb();
     if (!db) { res.json([]); return; }
@@ -135,7 +136,7 @@ router.get("/builder/payments", (req, res) => {
 });
 
 router.get("/activity", (req, res) => {
-  const limit = Math.min(Number(req.query["limit"] ?? 30), 200);
+  const limit = Math.min(Math.max(1, Number(req.query["limit"]) || 30), 200);
   try {
     const db = getDb();
     if (!db) { res.json([]); return; }

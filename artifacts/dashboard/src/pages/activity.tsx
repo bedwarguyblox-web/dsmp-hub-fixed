@@ -21,7 +21,7 @@ const ACTION_COLORS: Record<string, string> = {
   strike_add: "text-red-400",
   strike_remove: "text-emerald-400",
   strike_reset: "text-orange-400",
-  vouch_add: "text-indigo-400",
+  vouch_add: "text-sky-400",
   scam_vouch_add: "text-pink-400",
   builder_case_create: "text-amber-400",
   builder_case_start: "text-amber-300",
@@ -43,7 +43,7 @@ export default function Activity() {
       <div className="px-8 py-8 max-w-5xl">
         <PageHeader
           title="Activity Log"
-          subtitle="Last 100 staff actions — refreshes every 15 seconds"
+          subtitle="Last 100 staff actions — refreshes every 30 seconds"
         />
         <TableWrap>
           <thead>

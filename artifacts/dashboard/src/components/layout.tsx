@@ -31,7 +31,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
                   className={cn(
                     "flex items-center px-3 py-2 rounded-md text-sm transition-colors cursor-pointer",
                     active
-                      ? "bg-indigo-600 text-white font-medium"
+                      ? "bg-sky-600 text-white font-medium"
                       : "text-gray-400 hover:text-gray-100 hover:bg-white/5"
                   )}
                 >

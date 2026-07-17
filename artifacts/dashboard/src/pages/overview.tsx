@@ -18,11 +18,22 @@ function fmt(ts: string) {
   }
 }
 
+const ACTION_COLORS: Record<string, string> = {
+  strike_add: "text-red-400",
+  strike_remove: "text-emerald-400",
+  strike_reset: "text-orange-400",
+  vouch_add: "text-sky-400",
+  scam_vouch_add: "text-pink-400",
+  builder_case_create: "text-amber-400",
+  builder_case_start: "text-amber-300",
+  builder_case_complete: "text-emerald-400",
+  builder_case_dispute: "text-red-400",
+  builder_payment: "text-amber-400",
+  serverify: "text-blue-400",
+};
+
 function actionColor(t: string) {
-  if (t.includes("strike")) return "text-red-400";
-  if (t.includes("vouch")) return "text-indigo-400";
-  if (t.includes("builder")) return "text-amber-400";
-  return "text-gray-300";
+  return ACTION_COLORS[t] ?? "text-gray-300";
 }
 
 export default function Overview() {

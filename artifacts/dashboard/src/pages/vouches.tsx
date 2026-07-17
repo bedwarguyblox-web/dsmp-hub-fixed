@@ -72,7 +72,7 @@ export default function Vouches() {
             title="Top Vouched Users"
             data={vouches}
             loading={vLoading}
-            accent="text-indigo-400"
+            accent="text-sky-400"
           />
           <Board
             title="Top Scam Vouched Users"
